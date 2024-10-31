@@ -1,0 +1,20 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.env/
+
+# Logs
+*.log
+
+# Data files
+data/*.csv
+data/*.tsv
+data/*.json

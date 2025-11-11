@@ -1,0 +1,30 @@
+#!/bin/bash
+#BSUB -J "cpp_sweep[1-5]"        # adjust upper limit to number of configs
+#BSUB -q premium
+#BSUB -n 4
+#BSUB -R "span[ptile=1]"
+#BSUB -R affinity[core(4)]
+#BSUB -R rusage[mem=64G]
+#BSUB -W 12:00
+#BSUB -P acc_Clinical_Times_Series
+#BSUB -o logs/cpp_sweep.%J.%I.out
+#BSUB -e logs/cpp_sweep.%J.%I.err
+
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+CONFIG_FILE="sweep_configs.csv"
+ENV_PATH="/sc/arion/work/jegmij01/env_new/"   # adjust your env path
+mkdir -p logs results
+
+echo "LSB_JOBINDEX=${LSB_JOBINDEX}"
+echo "Reading config file: ${CONFIG_FILE}"
+
+# run runner script (pass LSB_JOBINDEX as --index)
+conda run --no-capture-output -p ${ENV_PATH} python run_config.py \
+    --config "${CONFIG_FILE}" \
+    --index ${LSB_JOBINDEX} \
+    --processed_root "/sc/arion/projects/Clinical_Times_Series/cpp_data/final/processed"
+
+echo "Done job ${LSB_JOBINDEX}"

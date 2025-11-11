@@ -1,0 +1,53 @@
+#!/bin/bash
+#BSUB -J "cpp_make_data[1-10]"
+#BSUB -q premium
+#BSUB -n 4
+#BSUB -R "span[ptile=1]"
+#BSUB -R affinity[core(4)]
+#BSUB -R rusage[mem=64G]
+#BSUB -W 12:00
+#BSUB -P acc_Clinical_Times_Series
+#BSUB -o logs/cpp_make_data.%J.%I.out
+#BSUB -e logs/cpp_make_data.%J.%I.err
+
+# Limit OpenBLAS / MKL threads to match LSF resources
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+# Define base paths
+DATA_ROOT=/sc/arion/projects/Clinical_Times_Series/cpp_data/final
+
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+# Define job array mapping: each job processes one (dataset, window) combination
+# Job array indices 1-10 map to:
+# 1-5: ctrl with windows [60,30,15,5,1]
+# 6-10: case with windows [60,30,15,5,1]
+
+case ${LSB_JOBINDEX} in
+    1) DATASET="ctrl"; WINDOW=60 ;;
+    2) DATASET="ctrl"; WINDOW=30 ;;
+    3) DATASET="ctrl"; WINDOW=15 ;;
+    4) DATASET="ctrl"; WINDOW=5 ;;
+    5) DATASET="ctrl"; WINDOW=1 ;;
+    6) DATASET="case"; WINDOW=60 ;;
+    7) DATASET="case"; WINDOW=30 ;;
+    8) DATASET="case"; WINDOW=15 ;;
+    9) DATASET="case"; WINDOW=5 ;;
+    10) DATASET="case"; WINDOW=1 ;;
+esac
+
+echo "Processing job array index: ${LSB_JOBINDEX}"
+echo "Dataset: ${DATASET}, Window: ${WINDOW} minutes"
+
+# Run pipeline with correct conda env
+conda run --no-capture-output -p /sc/arion/work/jegmij01/env_new/ \
+    python make_data.py \
+      --data_root ${DATA_ROOT} \
+      --dataset ${DATASET} \
+      --window ${WINDOW} \
+      --nan_threshold 0.3
+
+echo "Completed dataset: ${DATASET}, window: ${WINDOW}"

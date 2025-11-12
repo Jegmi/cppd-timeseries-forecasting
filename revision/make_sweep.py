@@ -22,9 +22,9 @@ def main(make_scripts: bool, n_pars_max: int = 1000):
     initial_uncertainties = [100] #, 30, 10, 3, 1]
     model_names = ['rls'] #, 'rls_logit', 'rls_poly', 'rls_logit_poly']
     model_names = model_names + [m + '_diag' for m in model_names] # add diag    
-    fields = ['cross'] #, 'block', 'hour', 'day']
-    K_mins = [300] # np.array([1, 2, 3, 4, 6, 8, 12, 16, 20])*60 # to minutes
-    K_days = [3] # [1, 2, 3, 5, 8]
+    fields = ['cross','block', 'hour', 'day']
+    K_mins = [100,300,600] # np.array([1, 2, 3, 4, 6, 8, 12, 16, 20])*60 # to minutes
+    K_days = [1,3,5] # [1, 2, 3, 5, 8]
     
     # === Fixed parameters ===
     min_days = 20 # patient selection before

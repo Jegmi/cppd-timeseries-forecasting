@@ -1,3 +1,34 @@
+def infer_meta_cols(df, exclude_cols=None, tol_unique=1):
+    """
+    Infer metadata columns: those that are constant across the DataFrame.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The run-level DataFrame.
+    exclude_cols : list, optional
+        Columns to ignore (e.g., obvious prediction or target columns).
+    tol_unique : int, default=1
+        Maximum number of unique non-NaN values to consider 'constant'.
+    
+    Returns
+    -------
+    list of str
+        Column names likely representing run-level metadata.
+    """
+    if exclude_cols is None:
+        exclude_cols = []
+
+    const_cols = []
+    for col in df.columns:
+        if col in exclude_cols:
+            continue
+        n_unique = df[col].nunique(dropna=True)
+        if n_unique <= tol_unique:
+            const_cols.append(col)
+    return const_cols
+
+
 def count_pars(modality, days, minutes, field, poly_feat=False, time_res=60, horizon=60, diag=False):
 
     def count_kalman(n_feat, n_out):

@@ -1,9 +1,8 @@
-from utils import _get_combined_features, get_x, load_and_process_grid
+from preprocessing import load_and_process_grid
 import numpy as np
 from scipy.stats import norm
 from scipy.special import logit, expit
 from sklearn.preprocessing import PolynomialFeatures
-
 
 class RecursiveLeastSquares:
     """
@@ -18,7 +17,7 @@ class RecursiveLeastSquares:
     def __init__(self, n_features, n_outputs=1, lambda_forget=0.99, 
                  initial_uncertainty=1000.0, output_space='linear',
                  clip_output=False, clip_range=(0, 1), epsilon=1e-6,
-                 transform='linear', degree=2):
+                 transform='linear', degree=2, diagonal_covariance=False):
         """
         Args:
             n_features: Dimension of input features (before transformation)
@@ -31,6 +30,7 @@ class RecursiveLeastSquares:
             epsilon: Small value to avoid log(0) (only for logit)
             transform: 'linear' or 'poly2' (polynomial with interaction terms only)
             degree: Polynomial degree (only if transform='poly2')
+            diagonal_covariance: If True, use diagonal approximation of P (faster, less memory)
         """
         self.n_features_input = n_features
         self.n_outputs = n_outputs
@@ -43,6 +43,9 @@ class RecursiveLeastSquares:
         self.clip_output = clip_output if output_space == 'linear' else False
         self.clip_range = clip_range
         self.epsilon = epsilon
+        
+        # Diagonal covariance approximation
+        self.diagonal_covariance = diagonal_covariance
         
         # Feature transformation
         if transform == 'linear':
@@ -60,7 +63,14 @@ class RecursiveLeastSquares:
         
         # Initialize parameters for transformed feature space
         self.w = np.zeros((n_outputs, self.n_features))
-        self.P = [initial_uncertainty * np.eye(self.n_features) for _ in range(n_outputs)]
+        
+        # Initialize covariance (diagonal or full)
+        if diagonal_covariance:
+            # Store only diagonal elements as 1D arrays
+            self.P = [initial_uncertainty * np.ones(self.n_features) for _ in range(n_outputs)]
+        else:
+            # Full covariance matrices
+            self.P = [initial_uncertainty * np.eye(self.n_features) for _ in range(n_outputs)]
         
         # Track prediction uncertainty (innovation variance)
         self.sigma2 = np.ones(n_outputs)
@@ -93,7 +103,31 @@ class RecursiveLeastSquares:
             return np.atleast_1d(x)
         else:
             return self.feature_transform.transform(np.atleast_1d(x).reshape(1, -1))[0]
-    
+
+    def get_n_params(self, include_covariance=True):
+        """
+        Count the number of parameters updated during recursion.
+        
+        Args:
+            include_covariance (bool): 
+                If True, count covariance matrix elements (P) as well.
+                If False, count only directly updated model parameters.
+        
+        Returns:
+            int: total number of recursively updated parameters
+        """
+        n_weights = self.w.size            # all w entries updated each step
+        n_sigma2 = self.sigma2.size        # variance estimates updated each step
+        
+        if include_covariance:
+            if self.diagonal_covariance:
+                n_cov = sum(P.size for P in self.P)  # Only diagonal elements
+            else:
+                n_cov = sum(P.size for P in self.P)  # Full matrices
+            return n_weights + n_sigma2 + n_cov
+        else:
+            return n_weights + n_sigma2
+            
     def update(self, x, y_true):
         """
         Online update with a single observation.
@@ -115,19 +149,37 @@ class RecursiveLeastSquares:
             # Transform y to working space
             y_working = self._transform_y(y_true[k])
             
-            # Prediction error
-            e = y_working - self.w[k] @ x_transformed
-            
-            # Kalman gain
-            Px = self.P[k] @ x_transformed
-            denominator = self.lambda_forget + x_transformed @ Px
-            K = Px / denominator
-            
-            # Parameter update
-            self.w[k] = self.w[k] + K * e
-            
-            # Covariance update (Joseph form for numerical stability)
-            self.P[k] = (self.P[k] - np.outer(K, Px)) / self.lambda_forget
+            if self.diagonal_covariance:
+                # Diagonal approximation
+                # Prediction error
+                e = y_working - self.w[k] @ x_transformed
+                
+                # Kalman gain (element-wise for diagonal)
+                Px = self.P[k] * x_transformed  # Element-wise multiplication
+                denominator = self.lambda_forget + np.sum(x_transformed * Px)
+                K = Px / denominator
+                
+                # Parameter update
+                self.w[k] = self.w[k] + K * e
+                
+                # Covariance update (diagonal approximation)
+                self.P[k] = (self.P[k] - K * x_transformed * self.P[k]) / self.lambda_forget
+                
+            else:
+                # Full covariance matrix
+                # Prediction error
+                e = y_working - self.w[k] @ x_transformed
+                
+                # Kalman gain
+                Px = self.P[k] @ x_transformed
+                denominator = self.lambda_forget + x_transformed @ Px
+                K = Px / denominator
+                
+                # Parameter update
+                self.w[k] = self.w[k] + K * e
+                
+                # Covariance update (Joseph form for numerical stability)
+                self.P[k] = (self.P[k] - np.outer(K, Px)) / self.lambda_forget
             
             # Update innovation variance
             self.sigma2[k] = self.lambda_var * self.sigma2[k] + (1-self.lambda_var) * e**2
@@ -173,7 +225,13 @@ class RecursiveLeastSquares:
                 
                 # Compute uncertainty
                 if return_std or return_intervals:
-                    var_working = x_transformed @ self.P[k] @ x_transformed + self.sigma2[k]
+                    if self.diagonal_covariance:
+                        # Diagonal approximation
+                        var_working = np.sum(x_transformed**2 * self.P[k]) + self.sigma2[k]
+                    else:
+                        # Full covariance
+                        var_working = x_transformed @ self.P[k] @ x_transformed + self.sigma2[k]
+                    
                     std_working = np.sqrt(var_working)
                     
                     if self.output_space == 'linear':
@@ -205,6 +263,40 @@ class RecursiveLeastSquares:
         if return_intervals:
             return y_pred, {'lower': y_lower, 'upper': y_upper}
         return y_pred
+
+
+def get_x(data, receptive_field, day, step, kernel_day, n_kernel_recent,n_forward):
+
+    block = data[day:day+kernel_day+1,step:step+n_kernel_recent+n_forward]                
+    xh = block[-1, :-n_forward]  # last row (hourly context)
+    xd = block[:-1, -n_forward]  # last columns (daily context)
+
+    if 'cross' in receptive_field:
+        x = list(xh) + list(xd)
+    elif 'block' in receptive_field:
+        x = list(block.copy().reshape(-1)[:-n_forward])  # remove target
+    elif 'hour' in receptive_field:
+        x = list(xh)
+    elif 'day' in receptive_field:
+        x = list(xd)
+    else:
+        assert x
+    return x
+
+def _get_combined_features(x_act, x_heart, forecasting_modality):
+    if forecasting_modality == 'ah|ah':
+        xa = x_act + x_heart
+        xh = x_act + x_heart
+    elif forecasting_modality == 'a|ah':
+        xa = x_act + x_heart
+        xh = x_heart
+    elif forecasting_modality == 'a|a':
+        xa = x_act
+        xh = x_heart
+    elif forecasting_modality == 'a|h':
+        xa = x_heart
+        xh = x_heart
+    return xa, xh
 
 
 def get_model(model_name, n_features, n_outputs=1, clip_output=True, clip_range=(0, 1), **kwargs):
@@ -242,6 +334,7 @@ def get_model(model_name, n_features, n_outputs=1, clip_output=True, clip_range=
     if 'rls' in model_name_lower:
         output_space = 'logit' if 'logit' in model_name_lower else 'linear'
         transform = 'poly' if 'poly' in model_name_lower else 'linear'
+        diagonal_covariance = 'diag' in model_name_lower
         
         model = RecursiveLeastSquares(
             n_features=n_features,
@@ -252,13 +345,27 @@ def get_model(model_name, n_features, n_outputs=1, clip_output=True, clip_range=
             clip_range=clip_range,
             initial_uncertainty=kwargs.get('initial_uncertainty', 1000.0),
             lambda_forget=kwargs.get('lambda_forget', 1.0),
+            diagonal_covariance=diagonal_covariance,
         )
 
     return model
 
-def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cross',
-             model_name='rls', 
-             verbose=0, min_days=30, forecasting_modality='a|a', prediction_horizon=60): #lambda_forget=0.99, initial_uncertainty=1000.0,
+def run_prob(
+    processed_path,
+    patient_id,
+    kernel_day,
+    n_kernel_recent,
+    field,
+    lambda_forget,
+    initial_uncertainty,
+    model_name='rls',
+    forecasting_modality='a|a',
+    prediction_horizon=60,
+    verbose=0,
+    min_days=0,
+    **kwargs
+):
+    
     """
     Online forecasting with Recursive Least Squares (RLS) or Logit-Normal RLS
     for activity and heart rate time series with automatic missing data handling.
@@ -271,8 +378,8 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
         Patient identifier.
     kernel_day : int, default=2
         Number of previous days in receptive field (time-delay embedding).
-    kernel_hour : int, default=2
-        Number of previous hours in receptive field (time-delay embedding).
+    n_kernel_recent : int, default=2
+        Number of previous time steps in receptive field (time-delay embedding).
     field : str, default='cross'
         Feature construction method. Options: 'cross', 'separate', 'concat'.
         Defines how historical observations are transformed into feature vectors.
@@ -300,8 +407,8 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
         - 'a|h': Predict activity from heart rate, heart rate from itself
     prediction_horizon : int, default=60
         Prediction horizon in minutes. Determines how far ahead predictions are made.
-        With time resolution of time_step minutes, the model predicts shift_steps
-        values where shift_steps = prediction_horizon / time_step.
+        With time resolution of dt minutes, the model predicts n_forward
+        values where n_forward = prediction_horizon / dt.
     
     Returns
     -------
@@ -365,9 +472,15 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
     Takens, F. (1981). Detecting strange attractors in turbulence. Lecture Notes
         in Mathematics, 898, 366-381.
     """
-
-    HEART_RATE_SCALE = 200
     
+    HEART_RATE_SCALE = 200
+
+    model_kwargs = {
+        'lambda_forget': lambda_forget,
+        'initial_uncertainty': initial_uncertainty,
+        **kwargs  # Additional params override defaults
+    }
+        
     # Validate inputs
     valid_modes = {'ah|ah', 'a|ah', 'a|a', 'a|h'}
     if forecasting_modality not in valid_modes:
@@ -385,31 +498,29 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
         print(f'Forecasting mode: {forecasting_modality}')
         print(f'Field: {field}')    
         
-    # Load data
+    # Load data (n_kernel_recent here should be renamed to n_recent_kernel, because its in timesteps)
     act, val_days, nan_days = load_and_process_grid(
         patient_id, processed_path, modality='activity', 
-        kernel_hour=kernel_hour, kernel_day=kernel_day)
+        n_kernel_recent=n_kernel_recent, kernel_day=kernel_day)
     heart, _, _ = load_and_process_grid(
         patient_id, processed_path, modality='heart', 
-        kernel_hour=kernel_hour, kernel_day=kernel_day)
+        n_kernel_recent=n_kernel_recent, kernel_day=kernel_day)
     sleep, _, _ = load_and_process_grid(
         patient_id, processed_path, modality='sleep', 
-        kernel_hour=kernel_hour, kernel_day=kernel_day)
-
+        n_kernel_recent=n_kernel_recent, kernel_day=kernel_day)
+        
     # Data statistics
     days = act.shape[0] - kernel_day
-    n_time_steps = act.shape[1] - kernel_hour  # Number of time steps per day
-    time_step = int(60 * 24 / n_time_steps)  # Time resolution in minutes
+    n_per_day = act.shape[1] - n_kernel_recent # Number of time steps per day
+    dt = int(60 * 24 / n_per_day)  # Time resolution in minutes,e.g. 1min, 15min, ..    
+    n_forward = int(prediction_horizon / dt) # Calculate prediction shift
     
-    # Calculate prediction shift (how many time steps = prediction horizon)
-    shift_steps = int(prediction_horizon / time_step)
-    
-    if shift_steps < 1:
-        raise ValueError(f"prediction_horizon ({prediction_horizon}min) must be >= time_step ({time_step}min)")
+    if n_forward < 1:
+        raise ValueError(f"prediction_horizon ({prediction_horizon}min) must be >= dt ({dt}min)")
     
     if verbose:
-        print(f'Time resolution: {time_step}min')
-        print(f'Prediction horizon: {prediction_horizon}min ({shift_steps} steps)')
+        print(f'Time resolution: {dt}min')
+        print(f'Prediction horizon: {prediction_horizon}min ({n_forward} steps)')
         print(f'Valid days: {val_days:.1f}, NaN days: {nan_days:.1f}, Total days: {days}')
     
     # Remove subjects without sufficient data
@@ -430,21 +541,21 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
     val_count = 0
     
     for day in range(days):    
-        for step in range(0, n_time_steps, shift_steps):
+        for step in range(0, n_per_day, n_forward):
             
-            if step + shift_steps > n_time_steps:
+            if step + n_forward > n_per_day:
                 continue
             
             # Extract features
             x_act = get_x(act_imputed, field, day, step, 
-                         kernel_day, kernel_hour, shift_steps)
+                         kernel_day, n_kernel_recent, n_forward)
             x_heart = get_x(heart_imputed, field, day, step, 
-                           kernel_day, kernel_hour, shift_steps)            
+                           kernel_day, n_kernel_recent, n_forward)            
 
             
             # Get true values (may contain NaN)
-            ya_true_seq = act[day + kernel_day, step + kernel_hour:step + kernel_hour + shift_steps]
-            yh_true_seq = heart_normalized[day + kernel_day, step + kernel_hour:step + kernel_hour + shift_steps]            
+            ya_true_seq = act[day + kernel_day, step + n_kernel_recent:step + n_kernel_recent + n_forward]
+            yh_true_seq = heart_normalized[day + kernel_day, step + n_kernel_recent:step + n_kernel_recent + n_forward]            
             
             # Combine features based on forecasting modality
             xa, xh = _get_combined_features(x_act, x_heart, forecasting_modality)
@@ -458,16 +569,16 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
                     # Impute missing with simple mean before model initialization
                     mean_a = np.nanmean(act_imputed)
                     mean_h = np.nanmean(heart_imputed)
-                    for i in range(shift_steps):
+                    for i in range(n_forward):
                         if np.isnan(ya_true_seq[i]):
-                            act_imputed[day + kernel_day, step + kernel_hour + i] = mean_a
-                            heart_imputed[day + kernel_day, step + kernel_hour + i] = mean_h
+                            act_imputed[day + kernel_day, step + n_kernel_recent + i] = mean_a
+                            heart_imputed[day + kernel_day, step + n_kernel_recent + i] = mean_h
                     continue
                 else:
                     # First valid sample: initialize with single update
-                    assert len(ax) == len(hx), 'activity and heart rate must have same length!'
-                    model_a = get_model(model_name, n_features=feat_dim, n_outputs=shift_steps, **model_kwargs)
-                    model_h = get_model(model_name, n_features=feat_dim, n_outputs=shift_steps, **model_kwargs)
+                    #assert len(xa) == len(xh), f'activity and heart rate must have same length! xa={len(xa)} xh={xh}'
+                    model_a = get_model(model_name, n_features=len(xa), n_outputs=n_forward, **model_kwargs)
+                    model_h = get_model(model_name, n_features=len(xh), n_outputs=n_forward, **model_kwargs)
                     
                     model_a.update(xa, ya_true_seq)
                     model_h.update(xh, yh_true_seq)
@@ -482,25 +593,25 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
             #ya_pred_seq, ya_std_seq = model_a.predict(np.array([xa]), return_std=True)
             yh_pred_seq, yh_intervals = model_h.predict(np.array([xh]), 
                                                       return_intervals=True, 
-                                                      confidence=0.95)
+                                                      confidence=0.9)
             
             ya_pred_seq, ya_intervals = model_a.predict(np.array([xa]), 
                                                         return_intervals=True, 
-                                                        confidence=0.95)
+                                                        confidence=0.9)
             
             # Extract from batch dimension
-            ya_pred_seq = ya_pred_seq[0]            
+            ya_pred_seq = ya_pred_seq[0]
             yh_pred_seq = yh_pred_seq[0]
             for k in ['lower','upper']:                
                 ya_intervals[k] = ya_intervals[k][0]
                 yh_intervals[k] = yh_intervals[k][0]
             
             # 2. IMPUTE missing values with predictions
-            for i in range(shift_steps):
+            for i in range(n_forward):
                 if np.isnan(ya_true_seq[i]):
-                    act_imputed[day + kernel_day, step + kernel_hour + i] = ya_pred_seq[i]
+                    act_imputed[day + kernel_day, step + n_kernel_recent + i] = ya_pred_seq[i]
                 if np.isnan(yh_true_seq[i]):
-                    heart_imputed[day + kernel_day, step + kernel_hour + i] = yh_pred_seq[i]
+                    heart_imputed[day + kernel_day, step + n_kernel_recent + i] = yh_pred_seq[i]
             
             # 3. UPDATE model with observation (even if partially missing!)
             # Critical: Model sees NaN values and updates uncertainty accordingly
@@ -512,18 +623,18 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
                 val_count += 1
             
             # Store results for each predicted time point
-            fac = time_step / 60.0  # Convert to hours
+            fac = dt / 60.0  # Convert to hours
             ya_observed_seq = ya_true_seq.copy()
             yh_observed_seq = yh_true_seq.copy()
             
-            for i in range(shift_steps):
+            for i in range(n_forward):
                 
                 res.append({
                     # Time indexing                    
                     'hour': (step + i) * fac,
                     'day': day,
-                    'time': day + (step + i) / n_time_steps,
-                    'valid_time': val_count / n_time_steps,                    
+                    'time': day + (step + i) / n_per_day,
+                    'valid_time': val_count / n_per_day,                    
                     
                     # Activity predictions and uncertainty
                     'activity_true': ya_observed_seq[i],
@@ -538,7 +649,7 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
                     'heart_up': yh_intervals['upper'][i] * HEART_RATE_SCALE,
                     
                     # Context
-                    'sleep': sleep[day + kernel_day, step + kernel_hour + i],
+                    'sleep': sleep[day + kernel_day, step + n_kernel_recent + i],
                     
                     # Model configuration
                     'model_name': model_name,
@@ -546,12 +657,15 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
                     'lambda_forget': lambda_forget,
                     'initial_uncertainty': initial_uncertainty,
                     'kernel_day': kernel_day,
-                    'kernel_hour': kernel_hour,
+                    'n_kernel_recent': n_kernel_recent,
+                    'kernel_hour': n_kernel_recent * fac,
+                    'n_pars_activity':model_a.get_n_params(),
+                    'n_pars_heart':model_h.get_n_params(),
                     
                     # Prediction metadata
-                    'time_step': time_step,
-                    'prediction_horizon': prediction_horizon,
-                    'shift_steps': shift_steps,
+                    'dt': dt,
+                    'prediction_horizon': prediction_horizon, # in minutes
+                    'n_forward': n_forward, # same in shifts
                     'prediction_index': i,  # Which step in the prediction sequence
                     
                     # Experimental design
@@ -566,10 +680,10 @@ def run_prob(processed_path, patient_id, kernel_day=2, kernel_hour=2, field='cro
         
         # Transfer imputed values across day boundary
         if day + kernel_day + 1 < act_imputed.shape[0]:
-            act_imputed[day+kernel_day+1, :kernel_hour] = \
-                act_imputed[day+kernel_day, -kernel_hour:]
-            heart_imputed[day+kernel_day+1, :kernel_hour] = \
-                heart_imputed[day+kernel_day, -kernel_hour:]
+            act_imputed[day+kernel_day+1, :n_kernel_recent] = \
+                act_imputed[day+kernel_day, -n_kernel_recent:]
+            heart_imputed[day+kernel_day+1, :n_kernel_recent] = \
+                heart_imputed[day+kernel_day, -n_kernel_recent:]
 
     if verbose:
         print(f'Completed: {len(res)} time points in output')

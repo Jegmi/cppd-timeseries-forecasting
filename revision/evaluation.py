@@ -153,10 +153,7 @@ def evaluate_run(
     metadata = {}
     for col in meta_cols:
         metadata[col] = df.iloc[0][col] if col in df.columns else np.nan
-
-    assert 'pid' in df.columns, 'need pid in df'
-    
-    
+        
     # Add sleep summary counts
     sleep_col = 'sleep'
     if sleep_col not in df.columns:
@@ -218,8 +215,7 @@ def evaluate_run(
             row.update(metrics)
             regression_rows.append(row)
     
-    regression_df = pd.DataFrame(regression_rows)
-    regression_df['pid'] = pid # add patient id
+    regression_df = pd.DataFrame(regression_rows)    
     
     # ========== 3. CLASSIFICATION AUC TABLE ==========
     classification_auc_rows = []
@@ -255,8 +251,7 @@ def evaluate_run(
             }
             classification_auc_rows.append(row)
     
-    classification_auc_df = pd.DataFrame(classification_auc_rows)
-    classification_auc_df['pid'] = pid # add patient id
+    classification_auc_df = pd.DataFrame(classification_auc_rows)    
     
     # ========== 4. CLASSIFICATION THRESHOLD TABLE ==========
     classification_threshold_rows = []
@@ -273,8 +268,14 @@ def evaluate_run(
             row.update(metrics)
             classification_threshold_rows.append(row)
     
-    classification_threshold_df = pd.DataFrame(classification_threshold_rows)
-    classification_threshold_df['pid'] = pid # add patient id
+    classification_threshold_df = pd.DataFrame(classification_threshold_rows)    
+
+    output = {
+        'metadata': metadata_df,
+        'regression': regression_df,
+        'classification_auc': classification_auc_df,
+        'classification_threshold': classification_threshold_df
+    }
     
     # Optional: Add threshold sweep results
     if do_threshold_sweep:
@@ -303,24 +304,11 @@ def evaluate_run(
                     }
                     sweep_rows.append(row)
         
-        threshold_sweep_df = pd.DataFrame(sweep_rows)
-        threshold_sweep_df['pid'] = pid # add patient id
-        
-        return {
-            'metadata': metadata_df,
-            'regression': regression_df,
-            'classification_auc': classification_auc_df,
-            'classification_threshold': classification_threshold_df,
-            'threshold_sweep': threshold_sweep_df
-        }
-    
-    return {
-        'metadata': metadata_df,
-        'regression': regression_df,
-        'classification_auc': classification_auc_df,
-        'classification_threshold': classification_threshold_df
-    }
+        threshold_sweep_df = pd.DataFrame(sweep_rows)        
 
+        output.update({'threshold_sweep': threshold_sweep_df})
+        
+    return output
 
 
 def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
@@ -349,10 +337,12 @@ def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
             
             # Load and prepare data
             df = pd.read_csv(path)
-            df['path'] = path
+            df['path'] = path # acts as primary key!
             df['run'] = i
             ordered = ['run'] + [c for c in df.columns if c not in ['run']]
             df = df[ordered]
+
+            assert 'pid' in df, f'pid must be in df.columns = {df.columns}'
             
             # Evaluate each patient
             file_metrics = {}
@@ -365,6 +355,10 @@ def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
                 for name, table in results.items():
                     if name not in file_metrics:
                         file_metrics[name] = []
+                    # add primary keys
+                    table['path'] = path
+                    table['run'] = i
+                    table['pid'] = pid
                     file_metrics[name].append(table)
             
             return file_metrics
@@ -372,31 +366,9 @@ def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
     except pd.errors.EmptyDataError:
         print(f"⚠️ Skipping empty file: {path}")
         return {}
-    except Exception as e:
-        print(f"❌ Error processing {path}: {e}")
-        return {}
-
-
-def merge_metrics(metrics_list):
-    """
-    Merge metrics from multiple files into a single dict of tables.
-    
-    Args:
-        metrics_list: List of dicts, each containing metrics from one file
-        
-    Returns:
-        dict: Combined metrics with format {'table_name': [df1, df2, ...]}
-    """
-    combined = {}
-    
-    for file_metrics in metrics_list:
-        for name, tables in file_metrics.items():
-            if name not in combined:
-                combined[name] = []
-            combined[name].extend(tables)
-    
-    return combined
-
+    #except Exception as e:
+    #   print(f"❌ Error processing {path}: {e}")
+    #  return {}
 
 def main():
     parser = argparse.ArgumentParser(
@@ -486,28 +458,25 @@ def main():
             total=len(indexed_paths),
             desc="Files processed"
         ))
+
+    # Combine tables across parameter settings
+    combined_results = {} 
+    for result in results:
+        for name, tables in result.items():
+            if name not in combined_results:
+                combined_results[name] = []
+            combined_results[name].extend(tables)
     
-    # Merge results from all files
-    print("🔗 Merging results...")
-    metrics = merge_metrics(results)
-    
-    # Save combined metrics
+    # Save combined tables after concat 
     print("💾 Saving metrics...")
-    for name, tables in metrics.items():
+    for name, tables in combined_results.items():
         if tables:  # Only save if we have data
             file_name = metrics_path / f'{name}.csv'
             combined_df = pd.concat(tables, ignore_index=True)
             combined_df.to_csv(file_name, index=False)
-            print(f"   ✓ Saved {len(combined_df)} rows to {file_name}")
+            print(f"   ✓ Saved {len(combined_df)} rows to {file_name}")    
     
     print("✅ Done!")
-    
-    # Print summary
-    print("\n📈 Summary:")
-    for name, tables in metrics.items():
-        total_rows = sum(len(t) for t in tables)
-        print(f"   {name}: {len(tables)} tables, {total_rows} total rows")
-
 
 if __name__ == '__main__':
     main()

@@ -15,13 +15,15 @@ from pathlib import Path
 
 def main(make_scripts: bool):
     # === Define parameters ===
-    run = '20251112_1611'
+    run = '20251117_1447' 
     base_path = '/sc/arion/projects/Clinical_Times_Series/cpp_data/runs'
     n_jobs = 16  # Number of parallel cores
     do_threshold_sweep = False
     
     # Derived paths
+    assert isinstance(run, str), f'run must be str, including an underscore but found {run} of type {type(run)}'
     runs_path = Path(base_path) / run
+    print(runs_path)
     predictions_path = runs_path / 'predictions'
     metrics_path = runs_path / 'results'
     
@@ -51,8 +53,8 @@ def main(make_scripts: bool):
 #BSUB -n {n_jobs}
 #BSUB -R "span[ptile=1]"
 #BSUB -R affinity[core({n_jobs})]
-#BSUB -R rusage[mem=128G]
-#BSUB -W 4:00
+#BSUB -R rusage[mem=32G]
+#BSUB -W 12:00
 #BSUB -P acc_Clinical_Times_Series
 #BSUB -o logs/eval_{run}.%J.out
 #BSUB -e logs/eval_{run}.%J.err

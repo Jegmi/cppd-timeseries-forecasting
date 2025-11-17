@@ -125,20 +125,108 @@ def classification_curve_metrics(y_true_bin, y_prob):
     return {'roc_auc': roc, 'pr_auc': pr, 'n': int(mask.sum())}
 
 
+# ========== Uncertainty Scores ========
+# Assuming 90 CI are read out
+# coverage < 0.90: Model is overconfident (P0 too small) → increase initial_uncertainty
+# coverage > 0.90: Model is underconfident (P0 too large) → decrease initial_uncertainty
+# coverage ≈ 0.90 but large width: Calibrated but not sharp → improve model features
+# Ideal: coverage ≈ 0.90 AND small width
+
+
+def coverage_metrics(y_true, y_pred, y_lower, y_upper, confidence=0.90):
+    """
+    Evaluate calibration of confidence intervals.
+    
+    Returns
+    -------
+    dict with:
+        - coverage: Fraction of observations within CI (should be ~0.90 for 90% CI)
+        - mean_width: Average width of confidence intervals
+        - sharpness: Width normalized by prediction scale
+        - coverage_bias: coverage - expected_coverage (should be ~0)
+    """
+    mask = y_true.notna() & y_pred.notna() & y_lower.notna() & y_upper.notna()
+    if mask.sum() == 0:
+        return {k: np.nan for k in ['coverage', 'mean_width', 'sharpness', 
+                                     'coverage_bias', 'n']}
+    
+    yt = y_true[mask].astype(float)
+    yp = y_pred[mask].astype(float)
+    yl = y_lower[mask].astype(float)
+    yu = y_upper[mask].astype(float)
+    
+    # Check if true value is within CI
+    within_ci = (yt >= yl) & (yt <= yu)
+    coverage = within_ci.mean()
+    
+    # Interval width statistics
+    widths = yu - yl
+    mean_width = widths.mean()
+    
+    # Sharpness: narrower intervals are better (if calibrated)
+    # Normalize by data range to make comparable across tasks
+    data_range = yt.max() - yt.min()
+    sharpness = mean_width / data_range if data_range > 0 else np.nan
+    
+    # Coverage bias: how far from expected coverage
+    coverage_bias = coverage - confidence
+    
+    return {
+        'coverage': coverage,
+        'mean_width': mean_width,
+        'sharpness': sharpness,
+        'coverage_bias': coverage_bias,
+        'n': int(mask.sum())
+    }
+
+def interval_score(y_true, y_lower, y_upper, alpha=0.10):
+    """
+    Interval score: lower is better. Proper scoring rule for interval forecasts.
+    
+    α = 1 - confidence (e.g., 0.10 for 90% CI)
+    
+    Score = (upper - lower) + (2/α) * (lower - y) * 1{y < lower}
+                             + (2/α) * (y - upper) * 1{y > upper}
+    
+    Reference: Gneiting & Raftery (2007) "Strictly Proper Scoring Rules"
+    """
+    mask = y_true.notna() & y_lower.notna() & y_upper.notna()
+    if mask.sum() == 0:
+        return {'interval_score': np.nan, 'n': 0}
+    
+    yt = y_true[mask].astype(float).values
+    yl = y_lower[mask].astype(float).values
+    yu = y_upper[mask].astype(float).values
+    
+    width = yu - yl
+    penalty_lower = (2 / alpha) * np.maximum(0, yl - yt)
+    penalty_upper = (2 / alpha) * np.maximum(0, yt - yu)
+    
+    score = width + penalty_lower + penalty_upper
+    
+    return {
+        'interval_score': score.mean(),
+        'interval_score_std': score.std(),
+        'n': int(mask.sum())
+    }
+
 
 def evaluate_run(
     df,
     meta_cols=None,
     thresholds=[0.01,1/3], # SB, MVPA
     do_threshold_sweep=False,
-    sweep_thresholds=None
+    sweep_thresholds=None,
+    evaluate_uncertainty=True,
+    burn_in_days = 10, # burn in time
 ):
     """
     Evaluate one run DataFrame and return 4 structured tables:
     1. metadata: Single row with run configuration
     2. regression: Metrics for activity and heart rate across sleep conditions
     3. classification_auc: ROC-AUC and PR-AUC metrics across conditions
-    4. classification_threshold: Threshold-based metrics across conditions
+    4. (optional) classification_threshold: Threshold-based metrics across conditions
+    5. (optional) uncertainty_calibration
     
     Returns
     -------
@@ -158,7 +246,15 @@ def evaluate_run(
     sleep_col = 'sleep'
     if sleep_col not in df.columns:
         raise KeyError(f"Expected column '{sleep_col}' in df")
+
+    # remove burn-in from predictions
+    n_before_burnin = len(df)
+    if 'time' in df.columns and burn_in_days>0:
+        df = df[df['time'] >= burn_in_days].copy()
     
+    metadata['n_before_burnin'] = n_before_burnin
+    metadata['n_after_burnin'] = len(df)
+    metadata['burn_in_days'] = burn_in_days    
     metadata['sleep_n_nan'] = int(df[sleep_col].isna().sum())
     metadata['sleep_n_true'] = int((df[sleep_col] == True).sum())
     metadata['sleep_n_false'] = int((df[sleep_col] == False).sum())
@@ -277,7 +373,7 @@ def evaluate_run(
         'classification_threshold': classification_threshold_df
     }
     
-    # Optional: Add threshold sweep results
+    # ==== 4.1 (Optional): Add threshold sweep results
     if do_threshold_sweep:
         if sweep_thresholds is None:
             sweep_thresholds = np.linspace(0, 1, 101)
@@ -307,7 +403,60 @@ def evaluate_run(
         threshold_sweep_df = pd.DataFrame(sweep_rows)        
 
         output.update({'threshold_sweep': threshold_sweep_df})
+
+    # ========== 5. (optional) UNCERTAINTY CALIBRATION TABLE ==========
+    if evaluate_uncertainty:
+        uncertainty_rows = []
         
+        # Check if CI columns exist
+        has_activity_ci = ('activity_low' in df.columns and 
+                          'activity_up' in df.columns)
+        has_heart_ci = ('heart_low' in df.columns and 
+                       'heart_up' in df.columns)
+        
+        tasks = []
+        if has_activity_ci:
+            tasks.append(('activity', 'activity_true', 'activity_pred', 
+                         'activity_low', 'activity_up'))
+        if has_heart_ci:
+            tasks.append(('heart', 'heart_true', 'heart_pred', 
+                         'heart_low', 'heart_up'))
+        
+        for task_name, col_true, col_pred, col_low, col_up in tasks:
+            for cond in sleep_conditions:
+                subdf = subset(cond)
+                
+                # Coverage metrics
+                cov_metrics = coverage_metrics(
+                    subdf[col_true],
+                    subdf[col_pred],
+                    subdf[col_low],
+                    subdf[col_up],
+                    confidence=0.90
+                )
+                
+                # Interval score
+                int_metrics = interval_score(
+                    subdf[col_true],
+                    subdf[col_low],
+                    subdf[col_up],
+                    alpha=0.10
+                )
+                
+                row = {
+                    'task': task_name,
+                    'condition': cond,
+                    **cov_metrics,
+                    **int_metrics
+                }
+                uncertainty_rows.append(row)
+        
+        if uncertainty_rows:
+            uncertainty_calibration_df = pd.DataFrame(uncertainty_rows)
+            output['uncertainty_calibration'] = uncertainty_calibration_df
+    
+
+    
     return output
 
 
@@ -336,11 +485,22 @@ def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
             )
             
             # Load and prepare data
-            df = pd.read_csv(path)
+            df = pd.read_csv(path)       
             df['path'] = path # acts as primary key!
             df['run'] = i
             ordered = ['run'] + [c for c in df.columns if c not in ['run']]
             df = df[ordered]
+
+            if 'burn_in_days' not in df.columns:
+                df['burn_in_days'] = 40 # fix calibration run
+            
+            # evaluate uncertainty? Assume one model per run!
+            models = df['model_name'].unique()
+            burn_in_days = df['burn_in_days'].unique()
+            assert len(burn_in_days)==1, f'only one burn_in_days per run allowed, but found {burn_in_days}'
+            burn_in_days = burn_in_days[0]
+            assert len(models) == 1, f'assuming one model per run only! but found {models}'            
+            evaluate_uncertainty = 'rls' in models # only rls has prob output
 
             assert 'pid' in df, f'pid must be in df.columns = {df.columns}'
             
@@ -349,7 +509,9 @@ def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
             for pid in df.pid.unique():
                 results = evaluate_run(
                     df[df.pid == pid], 
-                    do_threshold_sweep=do_threshold_sweep
+                    do_threshold_sweep=do_threshold_sweep,
+                    evaluate_uncertainty=evaluate_uncertainty,
+                    burn_in_days = burn_in_days                    
                 )
                 
                 for name, table in results.items():

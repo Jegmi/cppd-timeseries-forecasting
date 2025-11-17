@@ -13,39 +13,46 @@ ratio90 = [125, 18, 109, 19, 44, 104, 43, 50, 153, 4, 45, 108, 91, 25, 156, 81, 
 def compute_decay(T, window):
     return np.exp(- window / T)
 
-def main(make_scripts: bool, n_pars_max: int = 1000):
+def main(make_scripts: bool, n_pars_max: int = 10000, timestamp = None):
     # === Define parameter ranges ===
     patients = [-1] # ratio90 #list(range(159)) # will use ratio90
-    time_windows = [60] # 1, 5, 15, 30, 
-    forecasting_modalities = ['ah|ah', 'a|ah', 'a|a', 'a|h']
-    T_relevants = 24*60*np.array([1,2,3,4,5,6,8,10,15,20,25,30]) # convert days to minutes by 24*60
-    initial_uncertainties = [100] #, 30, 10, 3, 1]
-    model_names = ['rls'] #, 'rls_logit', 'rls_poly', 'rls_logit_poly']
-    model_names = model_names + [m + '_diag' for m in model_names] # add diag    
-    fields = ['cross','block', 'hour', 'day']
-    K_mins = [100,300,600] # np.array([1, 2, 3, 4, 6, 8, 12, 16, 20])*60 # to minutes
-    K_days = [1,3,5] # [1, 2, 3, 5, 8]
+    time_windows = [60] # 1, 5, 15, 30,
+    forecasting_modalities = ['a|a','a|h','a|ah','ah|ah'] # ['ah|ah', 'a|ah', 'a|a', 'a|h']
+    T_relevants = np.array([10,40])*24*60 # np.array([1,2,3,4,5,6,8,10,15,20,25,30,35,40])  # 
+    #initial_uncertainties = [round(5*(2/3)**n,2) for n in np.arange(12)] # 5 to 0.06
+    initial_uncertainties = [5] # [round(5*(2/3)**n,2) for n in np.arange(12)] # 5 to 0.06
+    # 0.05*np.array([100]) # [round(100 * (3/4)**n) for n in np.arange(12)]
+    model_names = ['rls']    
+    fields = ['cross','block','hour','day']
+    K_mins = [5*60] # np.array([1, 2, 3, 4, 6, 8, 10, 12, 16, 20])*60 # to minutes
+    K_days = [5] # [1, 2, 3, 4, 5, 7, 10]
+    
+    # Binary model configuration flags
+    use_diagonal = [True, False]
+    use_poly = [False, True] # [True, False] #to enable
+    use_logit = [False, True] # [True, False] #to enable
     
     # === Fixed parameters ===
     min_days = 20 # patient selection before
     prediction_horizon = 60 # min
     has_field = True
+    burn_in_days = 40 # (should correspond to max(T_relevants))
         
     # === Generate combinations (with filtering) ===
     dismissed = 0
     configs = []
-    for (p, w, fm, T, init_u, mname, fld, km, kd) in itertools.product(
+    for (p, w, fm, T, init_u, fld, km, kd, diag, poly, logit) in itertools.product(
         patients, time_windows, forecasting_modalities,
-        T_relevants, initial_uncertainties, model_names,
-        fields, K_mins, K_days
+        T_relevants, initial_uncertainties, fields, 
+        K_mins, K_days, use_diagonal, use_poly, use_logit
     ):
-        
+            
         lam = compute_decay(T, w)
-        
+
         n_pars = count_pars(modality=fm, days=kd, minutes=km, field=fld, 
-                            poly_feat='poly' in mname, time_res=w, 
-                            horizon=prediction_horizon, diag='diag' in mname)
-        
+                            poly_feat=poly, time_res=w, 
+                            horizon=prediction_horizon, diag=diag)        
+                
         if n_pars < n_pars_max:
             configs.append(dict(
                 patient_id=p,
@@ -54,13 +61,17 @@ def main(make_scripts: bool, n_pars_max: int = 1000):
                 lambda_forget=lam,
                 T_relevant=T,
                 initial_uncertainty=init_u,
-                model_name=mname,
                 field=fld,
                 has_field=has_field,
                 min_days=min_days,
                 prediction_horizon=prediction_horizon,
                 kernel_minutes=km,
-                kernel_day=kd
+                kernel_day=kd,
+                # Model configuration flags
+                diagonal_covariance=diag,
+                use_polynomial=poly,
+                use_logit_space=logit,
+                burn_in_days=burn_in_days
             ))
         else:
             dismissed += 1
@@ -78,7 +89,12 @@ def main(make_scripts: bool, n_pars_max: int = 1000):
 
     # === Prepare timestamped run folder ===
     base_run_path = "/sc/arion/projects/Clinical_Times_Series/cpp_data/runs/"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    else:
+        timestamp = str(timestamp)
+
     run_dir = os.path.join(base_run_path, timestamp)
     pred_dir = os.path.join(run_dir, "predictions")
 
@@ -98,8 +114,8 @@ def main(make_scripts: bool, n_pars_max: int = 1000):
 #BSUB -n 4
 #BSUB -R "span[ptile=1]"
 #BSUB -R affinity[core(4)]
-#BSUB -R rusage[mem=64G]
-#BSUB -W 12:00
+#BSUB -R rusage[mem=16G]
+#BSUB -W 1:00
 #BSUB -P acc_Clinical_Times_Series
 #BSUB -o logs/cpp_sweep.%J.%I.out
 #BSUB -e logs/cpp_sweep.%J.%I.err
@@ -143,9 +159,25 @@ bsub < run_sweep.lsf
     print(f"Created launcher → {launch_path}")
     print(f"Run folder ready: $CUR → {run_dir} ")
 
+def timestamp_type(x):
+    if x is None:
+        return None
+    if x == "" or x.lower() == "none":
+        return None
+    if '_' in x:
+        return x
+    raise argparse.ArgumentTypeError("timestamp format, e.g. 20251112_1611")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate sweep configs and optional LSF/launch scripts.")
     parser.add_argument("--make_scripts", type=lambda x: str(x).lower() in ["1", "true", "yes"], default=True,
                         help="If true (default), create timestamped folder and run scripts.")
+    parser.add_argument(
+        "--timestamp",
+        type=timestamp_type,
+        default=None,
+        help="Optional numeric timestamp string."
+    )
     args = parser.parse_args()
-    main(args.make_scripts)
+    main(args.make_scripts, timestamp=args.timestamp)

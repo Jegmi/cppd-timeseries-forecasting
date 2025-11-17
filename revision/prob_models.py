@@ -299,70 +299,79 @@ def _get_combined_features(x_act, x_heart, forecasting_modality):
     return xa, xh
 
 
-def get_model(model_name, n_features, n_outputs=1, clip_output=True, clip_range=(0, 1), **kwargs):
+def get_model(model_name, n_features, n_outputs=1, 
+              diagonal_covariance=False,
+              use_polynomial=False, 
+              use_logit_space=False,
+              clip_output=True, 
+              clip_range=(0, 1), 
+              **kwargs):
     """
-    Factory function to create model instances with optional output clipping.
+    Factory function to create RLS model with binary configuration flags.
     
     Parameters
     ----------
     model_name : str
-        String identifier for the model ('rls', 'rls_poly', 'rls_logit', 
-        'arima', 'persistence', 'lstm').
+        Keep for compatibility (e.g. including other models)
     n_features : int
-        Number of input features.
+        Number of input features (before transformation)
     n_outputs : int, optional
-        Number of output targets (default: 1).
+        Number of output targets (default: 1)
+    diagonal_covariance : bool, optional
+        If True, use diagonal approximation of covariance matrix (faster, less memory)
+    use_polynomial : bool, optional
+        If True, use polynomial feature transformation with interactions
+    use_logit_space : bool, optional
+        If True, use logit output space for [0,1] bounded predictions
     clip_output : bool, optional
-        Whether to clip model predictions (default: True).
+        Whether to clip predictions (only for linear space)
     clip_range : tuple, optional
-        Range for clipping predictions (default: (0, 1)).
+        Range for clipping predictions (default: (0, 1))
     **kwargs : dict
-        Additional model-specific parameters:
-        - For RLS: lambda_forget, initial_uncertainty
-        - For ARIMA: order (tuple), seasonal_order (tuple)
-        - For LSTM: hidden_size, num_layers, learning_rate, seq_length
+        Additional parameters: lambda_forget, initial_uncertainty, degree
     
     Returns
     -------
-    model
-        Configured model object, optionally wrapped with clipping transformer.
+    model : RecursiveLeastSquares
+        Configured RLS model instance
     """
     
-    model_name_lower = model_name.lower()
+    output_space = 'logit' if use_logit_space else 'linear'
+    transform = 'poly' if use_polynomial else 'linear'
     
-    # Recursive Least Squares variants
-    if 'rls' in model_name_lower:
-        output_space = 'logit' if 'logit' in model_name_lower else 'linear'
-        transform = 'poly' if 'poly' in model_name_lower else 'linear'
-        diagonal_covariance = 'diag' in model_name_lower
-        
-        model = RecursiveLeastSquares(
-            n_features=n_features,
-            n_outputs=n_outputs,
-            output_space=output_space,
-            transform=transform,
-            clip_output=clip_output,
-            clip_range=clip_range,
-            initial_uncertainty=kwargs.get('initial_uncertainty', 1000.0),
-            lambda_forget=kwargs.get('lambda_forget', 1.0),
-            diagonal_covariance=diagonal_covariance,
-        )
+    model = RecursiveLeastSquares(
+        n_features=n_features,
+        n_outputs=n_outputs,
+        output_space=output_space,
+        transform=transform,
+        diagonal_covariance=diagonal_covariance,
+        clip_output=clip_output,
+        clip_range=clip_range,
+        initial_uncertainty=kwargs.get('initial_uncertainty', 1000.0),
+        lambda_forget=kwargs.get('lambda_forget', 1.0),
+        degree=kwargs.get('degree', 2),
+    )
 
     return model
+
 
 def run_prob(
     processed_path,
     patient_id,
     kernel_day,
     n_kernel_recent,
-    field,
+    field,    
     lambda_forget,
     initial_uncertainty,
     model_name='rls',
+    diagonal_covariance=False,
+    use_polynomial=False,
+    use_logit_space=False,
     forecasting_modality='a|a',
     prediction_horizon=60,
     verbose=0,
     min_days=0,
+    burn_in_days=10,
     **kwargs
 ):
     
@@ -409,6 +418,12 @@ def run_prob(
         Prediction horizon in minutes. Determines how far ahead predictions are made.
         With time resolution of dt minutes, the model predicts n_forward
         values where n_forward = prediction_horizon / dt.
+    diagonal_covariance : bool, default=False
+        Use diagonal approximation of covariance matrix for efficiency
+    use_polynomial : bool, default=False
+        Apply polynomial feature transformation with interaction terms
+    use_logit_space : bool, default=False
+        Use logit output space for proper [0,1] modeling        
     
     Returns
     -------
@@ -444,21 +459,11 @@ def run_prob(
         a true Markov process with the forgetting factor λ providing adaptive
         windowing equivalent to exponentially weighted moving average.
     
-    Examples
+    Example
     --------
     # Gaussian RLS with default settings
     >>> results = run_prob(data_path, pid=123, model_name='rls')
-    
-    # Logit-Normal RLS for proper [0,1] modeling
-    >>> results = run_prob(data_path, pid=123, model_name='logit_rls')
-    
-    # Fast adaptation with shorter memory
-    >>> results = run_prob(data_path, pid=123, lambda_forget=0.95)
-    
-    # Cross-modal prediction with 2-hour horizon
-    >>> results = run_prob(data_path, pid=123, forecasting_modality='ah|ah',
-    ...                    prediction_horizon=120)
-    
+        
     References
     ----------
     Akaike, H. (1974). Markovian representation of stochastic processes.
@@ -478,17 +483,16 @@ def run_prob(
     model_kwargs = {
         'lambda_forget': lambda_forget,
         'initial_uncertainty': initial_uncertainty,
-        **kwargs  # Additional params override defaults
+        'diagonal_covariance': diagonal_covariance,
+        'use_polynomial': use_polynomial,
+        'use_logit_space': use_logit_space,
+        **kwargs
     }
-        
+    
     # Validate inputs
     valid_modes = {'ah|ah', 'a|ah', 'a|a', 'a|h'}
     if forecasting_modality not in valid_modes:
         raise ValueError(f"forecasting_modality must be one of {valid_modes}")
-    
-    valid_models = {'rls', 'logit_rls'}
-    if model_name not in valid_models:
-        raise ValueError(f"model_name must be one of {valid_models}")
     
     if not 0 < lambda_forget <= 1:
         raise ValueError(f"lambda_forget must be in (0, 1], got {lambda_forget}")
@@ -652,8 +656,11 @@ def run_prob(
                     'sleep': sleep[day + kernel_day, step + n_kernel_recent + i],
                     
                     # Model configuration
-                    'model_name': model_name,
+                    'model_name': model_name,                    
                     'field': field,
+                    'diagonal_covariance': diagonal_covariance,
+                    'use_polynomial': use_polynomial,
+                    'use_logit_space': use_logit_space,
                     'lambda_forget': lambda_forget,
                     'initial_uncertainty': initial_uncertainty,
                     'kernel_day': kernel_day,
@@ -672,6 +679,7 @@ def run_prob(
                     'forecasting_modality': forecasting_modality,
                     
                     # Data statistics
+                    'burn_in_days':burn_in_days,
                     'valid_days': val_days,
                     'nan_days': nan_days,
                     'total_days': days,

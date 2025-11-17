@@ -68,16 +68,16 @@ def load_and_process_grid(p_idx, data_path, modality='activity',
     modality : str, optional
         Data modality to extract (default: 'activity').
     n_kernel_recent : int, optional
-        Number of steps for horizontal padding/context (default: 5).
+        Number of steps for horizontal (past) context (default: 5).
     kernel_day : int, optional
-        Number of days for vertical padding/context (default: 3).
+        Number of days for vertical (bottom) initialization (default: 3).
     verbose : int, optional
         Print ID and valid / nan days (default : 0).
     
     Returns
     -------
     arr2 : np.ndarray
-        Processed 2D time series with shape (n_days, n_hours).
+        Processed 2D time series with shape (n_days + kernel_day, n_steps + n_kernel_recent).
     valid_days : float
         Number of days with valid (non-NaN) data.
     nan_days : float
@@ -103,16 +103,20 @@ def load_and_process_grid(p_idx, data_path, modality='activity',
         print(f'patient idx: {p_idx}. Valid data {valid_days:.1f}d, '
               f'nan data: {nan_days:.1f}d, total days {len(arr)}')    
     
-    # Padding for kernel initialization
-    max_pad = n_kernel_recent
+    # Padding:
+    # - Bottom: kernel_day rows for initialization (filled with mean)
+    # - Left: n_kernel_recent columns for past context
+    # - Right: 0 (predictions fill these positions during the loop)
+    # - Top: 0 (no future days needed)
     mean_value = np.mean(arr[~np.isnan(arr)])
-    arr2 = np.pad(arr.copy(), pad_width=[(max_pad, max_pad)], 
-                  mode='constant', constant_values=mean_value)
-    arr2 = arr2[:-max_pad, :-max_pad]
+    arr2 = np.pad(arr.copy(), 
+                  pad_width=[(kernel_day, 0), (n_kernel_recent, 0)], 
+                  mode='constant', 
+                  constant_values=mean_value)
     
-    # Initialize kernel based on the night
-    arr2[1:, :max_pad] = arr2[:-1, -max_pad:]  # create past
-    arr2 = arr2[max_pad - kernel_day:]
+    # Initialize temporal context across day boundaries:
+    # Copy end of previous day to start of next day (the left-padded region)
+    arr2[kernel_day+1:, :n_kernel_recent] = arr2[kernel_day:-1, -n_kernel_recent:]
     
     return arr2.copy(), valid_days, nan_days
 

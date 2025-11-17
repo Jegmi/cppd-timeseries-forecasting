@@ -502,7 +502,21 @@ def run_prob(
         print(f'Forecasting mode: {forecasting_modality}')
         print(f'Field: {field}')    
         
-    # Load data (n_kernel_recent here should be renamed to n_recent_kernel, because its in timesteps)
+    # Need to determine dt from metadata to calculate n_forward
+    loaded = np.load(processed_path, allow_pickle=True)
+    metadata = pd.DataFrame.from_records(loaded['metadata']).set_index('patient_count').loc[patient_id]
+    n_per_day = metadata['n_time_bins']
+    dt = int(60 * 24 / n_per_day)  # Time resolution in minutes, e.g. 1min, 15min, ..
+    n_forward = int(prediction_horizon / dt)  # Calculate prediction shift
+    
+    if n_forward < 1:
+        raise ValueError(f"prediction_horizon ({prediction_horizon}min) must be >= dt ({dt}min)")
+    
+    if verbose:
+        print(f'Time resolution: {dt}min')
+        print(f'Prediction horizon: {prediction_horizon}min ({n_forward} steps)')
+    
+    # Load data
     act, val_days, nan_days = load_and_process_grid(
         patient_id, processed_path, modality='activity', 
         n_kernel_recent=n_kernel_recent, kernel_day=kernel_day)
@@ -513,18 +527,10 @@ def run_prob(
         patient_id, processed_path, modality='sleep', 
         n_kernel_recent=n_kernel_recent, kernel_day=kernel_day)
         
-    # Data statistics
+    # Total days (after removing trimming nan rows with load_and_process_grid)
     days = act.shape[0] - kernel_day
-    n_per_day = act.shape[1] - n_kernel_recent # Number of time steps per day
-    dt = int(60 * 24 / n_per_day)  # Time resolution in minutes,e.g. 1min, 15min, ..    
-    n_forward = int(prediction_horizon / dt) # Calculate prediction shift
-    
-    if n_forward < 1:
-        raise ValueError(f"prediction_horizon ({prediction_horizon}min) must be >= dt ({dt}min)")
-    
+        
     if verbose:
-        print(f'Time resolution: {dt}min')
-        print(f'Prediction horizon: {prediction_horizon}min ({n_forward} steps)')
         print(f'Valid days: {val_days:.1f}, NaN days: {nan_days:.1f}, Total days: {days}')
     
     # Remove subjects without sufficient data
@@ -532,7 +538,7 @@ def run_prob(
         if verbose:
             print(f'Insufficient data: {val_days:.1f} valid days (required: {min_days})')
         return -1
-    
+                    
     # Normalize heart rate to [0, 1] range
     heart_normalized = heart / HEART_RATE_SCALE
     
@@ -692,7 +698,6 @@ def run_prob(
                 act_imputed[day+kernel_day, -n_kernel_recent:]
             heart_imputed[day+kernel_day+1, :n_kernel_recent] = \
                 heart_imputed[day+kernel_day, -n_kernel_recent:]
-
     if verbose:
         print(f'Completed: {len(res)} time points in output')
         if verbose > 1:

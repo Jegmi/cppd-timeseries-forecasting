@@ -2,11 +2,15 @@ import argparse
 import os
 import pandas as pd
 from functools import partial
+import traceback
 
-# List of patients to run when patient_id == -1
-RATIO90_PATIENTS = [
-    125, 18, 109, 19, 44, 104, 43, 50, 153, 4, 45, 108, 91, 25, 156, 81, 52, 9, 138
-]
+# Cohort definitions
+PATIENT_COHORTS = {
+    "calibration": [125, 18, 109, 19, 44, 104, 43, 50, 153, 4, 45, 108, 91, 25, 156, 81, 52, 9, 138],  # case, highest quality
+    "ctrl": list(range(71)), # control group
+    "case" : list(range(159))
+}
+PATIENT_COHORTS["validation"] = [i for i in range(159) if i not in PATIENT_COHORTS["calibration"]] # case, but not in calibration
 
 def main():
     p = argparse.ArgumentParser()
@@ -26,7 +30,7 @@ def main():
     row = df.iloc[args.index - 1]  # convert 1-based LSF index to 0-based
     
     # Common parameters
-    patient_id = int(row["patient_id"]) 
+    patient_id = row["patient_id"] # int for single patient, otherwise str 
     window = int(row["window"])
     forecasting_modality = str(row["forecasting_modality"])
     model_name = str(row.get("model_name", "rls"))
@@ -35,10 +39,16 @@ def main():
     prediction_horizon = int(row.get("prediction_horizon", 60))
     burn_in_days = int(row.get("burn_in_days", 10)) # only used for eval
     verbose = 1
-
-    # choose processed path depending on case/ctrl logic
-    processed_path = os.path.join(args.processed_root, f"case/revision_nan_all_patients_{window}.npz")
     
+    # Resolve patient specification to list of IDs and data path
+    try:
+        patient_ids = [int(patient_id)]
+        cohort_dir = 'case'
+    except (ValueError, TypeError):
+        patient_ids = PATIENT_COHORTS[patient_id]
+        cohort_dir = 'ctrl' if patient_id == 'ctrl' else 'case'
+    processed_path = os.path.join(args.processed_root, f"{cohort_dir}/revision_nan_all_patients_{window}.npz")
+                
     # Define safe_mod early for output filename
     safe_mod = forecasting_modality.replace("|", "_")
 
@@ -76,45 +86,55 @@ def main():
             prediction_horizon=prediction_horizon,
             burn_in_days=burn_in_days
         )
-        
-        # This list will hold the final results
-        final_results = []
-        
-        if patient_id == -1:
-            # Run all patients in the RATIO90_PATIENTS list
-            print(f"==== Running config for Job {args.index}: Patient ID -1 (processing {len(RATIO90_PATIENTS)} patients) ====")
-            print(row.to_dict())
-            print("Processed path:", processed_path)
-            print("========================")
-            
-            for pid_from_list in RATIO90_PATIENTS:
-                print(f"--- Processing patient: {pid_from_list} ---")
-                try:
-                    # Only need to pass patient_id now
-                    single_patient_res = run_prob_configured(patient_id=pid_from_list)
-                    if single_patient_res:
-                        final_results.extend(single_patient_res)
-                except Exception as e:
-                    print(f"!!! ERROR processing patient {pid_from_list} for job {args.index}: {e}")
-                    final_results.append({
-                        "job_index": args.index - 1,
-                        "config_patient_id": patient_id,
-                        "processed_patient_id": pid_from_list,
-                        "error": str(e)
-                    })
-            
-            res = final_results
 
-        else:
-            # Run for single patient specified in config
-            print(f"==== Running config for Job {args.index}: Patient ID {patient_id} (single) ====")
-            print(row.to_dict())
-            print("Processed path:", processed_path)
-            print("========================")
-            
-            # Only need to pass patient_id now
-            res = run_prob_configured(patient_id=patient_id)
+        # Determine cohort name for logging and output        
+
+        print(f"==== Running config for Job {args.index}: {cohort_dir} ({len(patient_ids)} patient{'s' if len(patient_ids) > 1 else ''}) ====")
+        print(row.to_dict())
+        print("Processed path:", processed_path)
+        print(f"Patient IDs: {patient_ids[:5]}{'...' if len(patient_ids) > 5 else ''}")
+        print("========================")
         
+        # init results
+        success = []
+        failure = []
+                    
+        for pid in patient_ids:
+            print(f"--- Processing patient: {pid} ---")
+            try:
+                single = run_prob_configured(patient_id=pid)
+        
+                # if insufficient data
+                if single[0]['valid_days'] < single[0]['min_days']:
+                    print("insufficient data for pid:", pid)
+                    failure.append({
+                        "pid": pid,
+                        "valid_days": single[0]['valid_days'],
+                        "nan_days": single[0]['nan_days'],
+                        "total_days": single[0]['total_days'],
+                        "min_days": single[0]['min_days'],
+                        "reason": "insufficient_data",
+                        "job_index": args.index - 1,
+                    })
+                    continue
+        
+                # if success
+                success.extend(single)
+
+            # if unknown failure
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"!!! ERROR processing patient {pid} for job {args.index}: {e}")
+                print(tb)
+        
+                failure.append({
+                    "pid": pid,
+                    "job_index": args.index - 1,
+                    "error": str(e),
+                    "traceback": tb,
+                    "reason": "exception",
+                })
+       
         # Create output filename with binary flags (0/1)
         diag_flag = 1 if diagonal_covariance else 0
         poly_flag = 1 if use_polynomial else 0
@@ -129,13 +149,24 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         
         out_path = os.path.join(out_dir, output_file)
-        
+        failed_path = os.path.join(out_dir, "failed.csv")
+                
         # Save results
-        if res is not None and len(res) > 0:
-            pd.DataFrame(res).to_csv(out_path, index=False)
-            print("Saved:", out_path)
+        if success:
+            df = pd.DataFrame(success)
+            df['cohort'] = cohort_dir
+            df.to_csv(out_path, index=False)
+            print(f"Saved {len(success)} results to: {out_path}")
         else:
-            print(f"No results generated for job {args.index}, patient_id {patient_id}. No file saved.")
+            print(f"No results generated for job {args.index}. No file saved.")
+
+        if failure:
+            df_fail = pd.DataFrame(failure)
+            df_fail['cohort'] = cohort_dir
+            df_fail.to_csv(failed_path, index=False, mode='a',
+                           header=not os.path.exists(failed_path))
+            print(f"Saved {len(failure)} failures to: {failed_path}")
+            
 
     else:  # baseline models
         print(f'Implement baseline models for job {args.index}')

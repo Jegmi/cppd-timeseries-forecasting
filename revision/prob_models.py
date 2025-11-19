@@ -1,5 +1,6 @@
 from preprocessing import load_and_process_grid
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
 from scipy.special import logit, expit
 from sklearn.preprocessing import PolynomialFeatures
@@ -503,6 +504,7 @@ def run_prob(
         print(f'Field: {field}')    
         
     # Need to determine dt from metadata to calculate n_forward
+    
     loaded = np.load(processed_path, allow_pickle=True)
     metadata = pd.DataFrame.from_records(loaded['metadata']).set_index('patient_count').loc[patient_id]
     n_per_day = metadata['n_time_bins']
@@ -537,7 +539,12 @@ def run_prob(
     if val_days < min_days:
         if verbose:
             print(f'Insufficient data: {val_days:.1f} valid days (required: {min_days})')
-        return -1
+        return [{'valid_days': val_days,
+                    'nan_days': nan_days,
+                    'total_days': days,
+                    'min_days' : min_days,
+                    'pid': patient_id
+                }]        
                     
     # Normalize heart rate to [0, 1] range
     heart_normalized = heart / HEART_RATE_SCALE
@@ -685,6 +692,7 @@ def run_prob(
                     'forecasting_modality': forecasting_modality,
                     
                     # Data statistics
+                    'min_days': min_days,
                     'burn_in_days':burn_in_days,
                     'valid_days': val_days,
                     'nan_days': nan_days,

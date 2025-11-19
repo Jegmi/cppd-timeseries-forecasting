@@ -15,7 +15,7 @@ from pathlib import Path
 
 def main(make_scripts: bool):
     # === Define parameters ===
-    run = '20251117_1447' 
+    run = '20251118_1926' 
     base_path = '/sc/arion/projects/Clinical_Times_Series/cpp_data/runs'
     n_jobs = 16  # Number of parallel cores
     do_threshold_sweep = False
@@ -53,7 +53,7 @@ def main(make_scripts: bool):
 #BSUB -n {n_jobs}
 #BSUB -R "span[ptile=1]"
 #BSUB -R affinity[core({n_jobs})]
-#BSUB -R rusage[mem=32G]
+#BSUB -R rusage[mem=16G]
 #BSUB -W 12:00
 #BSUB -P acc_Clinical_Times_Series
 #BSUB -o logs/eval_{run}.%J.out
@@ -107,14 +107,4 @@ bsub < make_eval.lsf
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate evaluation scripts for parallel processing."
-    )
-    parser.add_argument(
-        "--make_scripts",
-        action="store_true",
-        help="Create LSF and launch scripts (otherwise just show config)"
-    )
-    args = parser.parse_args()
-    
-    main(args.make_scripts)
+    main(True)

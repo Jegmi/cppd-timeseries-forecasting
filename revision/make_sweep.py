@@ -8,35 +8,39 @@ from datetime import datetime
 import argparse
 from utils import count_pars
 
-ratio90 = [125, 18, 109, 19, 44, 104, 43, 50, 153, 4, 45, 108, 91, 25, 156, 81, 52, 9, 138]
+#BAD_PID = [ 1.,   2.,  11.,  13.,  21.,  22.,  26.,  39.,  49.,  53.,  80.,
+#        93.,  94.,  95.,  98., 112., 113., 132., 133., 134., 141., 144.,
+#       147., 155., 157.]
+
+#job_index = [10, 100] # but probably it's every job
 
 def compute_decay(T, window):
     return np.exp(- window / T)
 
 def main(make_scripts: bool, n_pars_max: int = 10000, timestamp = None):
     # === Define parameter ranges ===
-    patients = [-1] # ratio90 #list(range(159)) # will use ratio90
-    time_windows = [60] # 1, 5, 15, 30,
-    forecasting_modalities = ['a|a','a|h','a|ah','ah|ah'] # ['ah|ah', 'a|ah', 'a|a', 'a|h']
+    patients = ['calibration'] # see run_config.py for cohort-to-patient mapping
+    time_windows = [1,5,15,30] # 1, 5, 15, 30,
+    forecasting_modalities = ['a|a','a|h','a|ah'] # ['ah|ah', 'a|ah', 'a|a', 'a|h']
     T_relevants = np.array([10,40])*24*60 # np.array([1,2,3,4,5,6,8,10,15,20,25,30,35,40])  # 
     #initial_uncertainties = [round(5*(2/3)**n,2) for n in np.arange(12)] # 5 to 0.06
     initial_uncertainties = [5] # [round(5*(2/3)**n,2) for n in np.arange(12)] # 5 to 0.06
     # 0.05*np.array([100]) # [round(100 * (3/4)**n) for n in np.arange(12)]
-    model_names = ['rls']    
+    model_names = ['rls']
     fields = ['cross','block','hour','day']
-    K_mins = [5*60] # np.array([1, 2, 3, 4, 6, 8, 10, 12, 16, 20])*60 # to minutes
-    K_days = [5] # [1, 2, 3, 4, 5, 7, 10]
+    K_mins = [1*60, 5*60, 10*60] # np.array([1, 2, 3, 4, 6, 8, 10, 12, 16, 20])*60 # to minutes
+    K_days = [1,5] # [1, 2, 3, 4, 5, 7, 10]
     
     # Binary model configuration flags
-    use_diagonal = [True, False]
-    use_poly = [False, True] # [True, False] #to enable
-    use_logit = [False, True] # [True, False] #to enable
+    use_diagonal = [False]
+    use_poly = [False] # [True, False] #to enable
+    use_logit = [False] # [True, False] #to enable
     
     # === Fixed parameters ===
     min_days = 20 # patient selection before
-    prediction_horizon = 60 # min
+    prediction_horizon = 30 # min
     has_field = True
-    burn_in_days = 40 # (should correspond to max(T_relevants))
+    burn_in_days = 10 # (should correspond to max(T_relevants))
         
     # === Generate combinations (with filtering) ===
     dismissed = 0
@@ -115,7 +119,7 @@ def main(make_scripts: bool, n_pars_max: int = 10000, timestamp = None):
 #BSUB -R "span[ptile=1]"
 #BSUB -R affinity[core(4)]
 #BSUB -R rusage[mem=16G]
-#BSUB -W 1:00
+#BSUB -W 4:00
 #BSUB -P acc_Clinical_Times_Series
 #BSUB -o logs/cpp_sweep.%J.%I.out
 #BSUB -e logs/cpp_sweep.%J.%I.err

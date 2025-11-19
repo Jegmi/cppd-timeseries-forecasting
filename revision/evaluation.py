@@ -6,7 +6,9 @@ Usage:
     python evaluate_parallel.py --run 20251112_1611 --n-jobs -1  # Use all cores
 """
 import argparse
+import os
 import glob
+import re
 import warnings
 from pathlib import Path
 from functools import partial
@@ -49,21 +51,80 @@ def regression_metrics(y_true, y_pred):
     corr = safe_pearsonr(yt, yp)
     return {'rmse': rmse, 'mae': mae, 'r2': r2, 'corr': corr, 'n': int(mask.sum())}
 
+
+def normalize_threshold(threshold):
+    """
+    Normalize threshold to (value, invert) tuple.
+    
+    Parameters
+    ----------
+    threshold : float or tuple
+        Either a float threshold or (threshold, invert) tuple
+        
+    Returns
+    -------
+    tuple : (float, bool)
+        (threshold_value, should_invert)
+        
+    Examples
+    --------
+    >>> normalize_threshold(0.5)
+    (0.5, False)
+    >>> normalize_threshold((0.01, True))
+    (0.01, True)
+    """
+    if isinstance(threshold, tuple):
+        if len(threshold) != 2:
+            raise ValueError(f"Threshold tuple must be (value, invert), got {threshold}")
+        return float(threshold[0]), bool(threshold[1])
+    return float(threshold), False
+
+
 def thresholded_classification_metrics(y_true_bin, y_prob, threshold=0.5):
     """
     Compute classification metrics at a single threshold.
-    y_true_bin: binary (0/1) Series
-    y_prob: probability-like Series (0..1)
-    Returns dict with sensitivity, specificity, precision, npv, percent_agreement, f1, mcc, support_pos, support_neg
+    
+    Parameters
+    ----------
+    y_true_bin : pd.Series
+        Binary (0/1) target values
+    y_prob : pd.Series
+        Probability-like predictions (0..1)
+    threshold : float or tuple
+        Either a float threshold, or (threshold, invert) tuple.
+        If invert=True, predictions are inverted: y_pred = (y_prob < threshold)
+        
+    Returns
+    -------
+    dict : Classification metrics including sensitivity, specificity, etc.
+    
+    Examples
+    --------
+    # Standard: detect MVPA (activity >= 0.33)
+    metrics = thresholded_classification_metrics(y_true, y_pred, threshold=0.33)
+    
+    # Inverted: detect sedentary (activity < 0.01)  
+    metrics = thresholded_classification_metrics(y_true, y_pred, threshold=(0.01, True))
     """
+    # Parse threshold
+    threshold_value, invert = normalize_threshold(threshold)
+    
     mask = y_true_bin.notna() & y_prob.notna()
     if mask.sum() == 0:
-        return {k: np.nan for k in ['sensitivity','specificity','precision','npv','percent_agreement','f1','mcc','tp','tn','fp','fn','n']}
+        return {k: np.nan for k in ['sensitivity','specificity','precision','npv',
+                                     'percent_agreement','f1','mcc','tp','tn','fp','fn','n',
+                                     'threshold_value','inverted']}
+    
     y_true = y_true_bin[mask].astype(int)
-    y_prob = y_prob[mask].astype(float)
-    y_pred = (y_prob >= threshold).astype(int)
-
-    # confusion matrix: TN, FP, FN, TP
+    y_prob_masked = y_prob[mask].astype(float)
+    
+    # Apply threshold with optional inversion
+    if invert:
+        y_pred = (y_prob_masked < threshold_value).astype(int)
+    else:
+        y_pred = (y_prob_masked >= threshold_value).astype(int)
+    
+    # Confusion matrix: TN, FP, FN, TP
     try:
         tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0,1]).ravel()
     except ValueError:
@@ -72,14 +133,14 @@ def thresholded_classification_metrics(y_true_bin, y_prob, threshold=0.5):
         fp = int(((y_true == 0) & (y_pred == 1)).sum())
         fn = int(((y_true == 1) & (y_pred == 0)).sum())
 
-    # metrics with safe divisions
+    # Metrics with safe divisions
     def safe_div(a, b):
         return (a / b) if b != 0 else np.nan
 
-    sensitivity = safe_div(tp, tp + fn)   # recall, TPR
-    specificity = safe_div(tn, tn + fp)   # TNR
-    precision = safe_div(tp, tp + fp)     # PPV
-    npv = safe_div(tn, tn + fn)           # NPV
+    sensitivity = safe_div(tp, tp + fn)
+    specificity = safe_div(tn, tn + fp)
+    precision = safe_div(tp, tp + fp)
+    npv = safe_div(tn, tn + fn)
     percent_agreement = safe_div(tp + tn, tp + tn + fp + fn)
     
     try:
@@ -101,8 +162,11 @@ def thresholded_classification_metrics(y_true_bin, y_prob, threshold=0.5):
         'f1': f1,
         'mcc': mcc,
         'tp': int(tp), 'tn': int(tn), 'fp': int(fp), 'fn': int(fn),
-        'n': int(mask.sum())
+        'n': int(mask.sum()),
+        'threshold_value': threshold_value,
+        'inverted': invert
     }
+
 
 def classification_curve_metrics(y_true_bin, y_prob):
     """
@@ -214,27 +278,40 @@ def interval_score(y_true, y_lower, y_upper, alpha=0.10):
 def evaluate_run(
     df,
     meta_cols=None,
-    thresholds=[0.01,1/3], # SB, MVPA
+    thresholds=None,  # Now more flexible
     do_threshold_sweep=False,
     sweep_thresholds=None,
     evaluate_uncertainty=True,
-    burn_in_days = 10, # burn in time
+    burn_in_days=10,
 ):
     """
-    Evaluate one run DataFrame and return 4 structured tables:
-    1. metadata: Single row with run configuration
-    2. regression: Metrics for activity and heart rate across sleep conditions
-    3. classification_auc: ROC-AUC and PR-AUC metrics across conditions
-    4. (optional) classification_threshold: Threshold-based metrics across conditions
-    5. (optional) uncertainty_calibration
+    Evaluate one run DataFrame and return structured tables.
     
-    Returns
-    -------
-    dict with keys: 'metadata', 'regression', 'classification_auc', 'classification_threshold'
-    """
-
+    Parameters
+    ----------
+    thresholds : dict, optional
+        Dict mapping target names to thresholds. Each threshold can be:
+        - float: standard threshold (y_pred >= threshold)
+        - tuple: (threshold, invert) where invert=True means y_pred < threshold
         
-    # ========== 1. METADATA TABLE ==========
+        Default:
+        {
+            'sedentary_bout': (0.01, True),   # activity < 0.01
+            'absent_sedentary': 0.01,          # activity >= 0.01  
+            'mvpa': 1/3                        # activity >= 0.33
+        }
+    """
+    # Default thresholds with clear semantics
+    if thresholds is None:
+        thresholds = {
+            'sedentary_bout': (0.01, True),   # Detect LOW activity
+            'absent_sedentary': 0.01,          # Detect NON-sedentary
+            'mvpa': 1/3                        # Detect moderate-vigorous
+        }
+    
+    # [Rest of your metadata and setup code...]
+    
+    # ========== METADATA TABLE ==========
     if meta_cols is None:
         meta_cols = infer_meta_cols(df)
 
@@ -242,14 +319,13 @@ def evaluate_run(
     for col in meta_cols:
         metadata[col] = df.iloc[0][col] if col in df.columns else np.nan
         
-    # Add sleep summary counts
     sleep_col = 'sleep'
     if sleep_col not in df.columns:
         raise KeyError(f"Expected column '{sleep_col}' in df")
 
-    # remove burn-in from predictions
+    # Remove burn-in
     n_before_burnin = len(df)
-    if 'time' in df.columns and burn_in_days>0:
+    if 'time' in df.columns and burn_in_days > 0:
         df = df[df['time'] >= burn_in_days].copy()
     
     metadata['n_before_burnin'] = n_before_burnin
@@ -273,7 +349,7 @@ def evaluate_run(
         else:
             raise ValueError(f"Unknown condition: {condition}")
 
-    # Prepare classification targets
+    # Prepare data
     df = df.copy()
     n_before = len(df)
     df = df[~df['activity_true'].isna()]
@@ -283,17 +359,18 @@ def evaluate_run(
         preds = pd.to_numeric(df['activity_pred'], errors='coerce')
         assert (preds.max() <= 1) & (preds.min() >= 0), 'predictions must be in [0, 1]'
     
-    # Define binary classification targets
+    # Define binary targets
+    target_names = ['sedentary_bout', 'absent_sedentary', 'mvpa']
+    df['sedentary_bout'] = (df['activity_true'] == 0).astype(float)
     df['absent_sedentary'] = (df['activity_true'] > 0).astype(float)
     df['mvpa'] = (df['activity_true'] > (1/3)).astype(float)
     
     metadata_df['n_before_dropna'] = n_before
     metadata_df['n_after_dropna'] = n_after
 
-    # Sleep conditions to evaluate
     sleep_conditions = ['all', 'sleep_false', 'sleep_true']
     
-    # ========== 2. REGRESSION TABLE ==========
+    # ========== REGRESSION TABLE ==========
     regression_rows = []
     tasks = {
         'activity': ('activity_true', 'activity_pred'),
@@ -313,15 +390,21 @@ def evaluate_run(
     
     regression_df = pd.DataFrame(regression_rows)    
     
-    # ========== 3. CLASSIFICATION AUC TABLE ==========
+    # ========== CLASSIFICATION AUC TABLE ==========
     classification_auc_rows = []
     
-    for target_name in ['absent_sedentary', 'mvpa']:
+    for target_name in target_names:
         for cond in sleep_conditions:
             subdf = subset(cond)
+            
+            # For sedentary_bout, we need to invert predictions for AUC
+            y_prob = subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float)
+            if target_name == 'sedentary_bout':
+                y_prob = 1 - y_prob  # Invert: want low activity scores
+            
             metrics = classification_curve_metrics(
                 subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
-                subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float)
+                y_prob
             )
             
             # Add label balance info
@@ -349,18 +432,20 @@ def evaluate_run(
     
     classification_auc_df = pd.DataFrame(classification_auc_rows)    
     
-    # ========== 4. CLASSIFICATION THRESHOLD TABLE ==========
+    # ========== CLASSIFICATION THRESHOLD TABLE ==========
     classification_threshold_rows = []
     
-    for (target_name, threshold_for_target) in zip(['absent_sedentary', 'mvpa'], thresholds):
+    for target_name in target_names:
+        threshold = thresholds.get(target_name, 0.5)
+        
         for cond in sleep_conditions:
             subdf = subset(cond)
             metrics = thresholded_classification_metrics(
                 subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
                 subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float),
-                threshold=threshold_for_target
+                threshold=threshold
             )
-            row = {'target': target_name, 'condition': cond, 'threshold': threshold_for_target}
+            row = {'target': target_name, 'condition': cond}
             row.update(metrics)
             classification_threshold_rows.append(row)
     
@@ -373,26 +458,34 @@ def evaluate_run(
         'classification_threshold': classification_threshold_df
     }
     
-    # ==== 4.1 (Optional): Add threshold sweep results
+    # ========== THRESHOLD SWEEP (OPTIONAL) ==========
     if do_threshold_sweep:
         if sweep_thresholds is None:
             sweep_thresholds = np.linspace(0, 1, 101)
         
         sweep_rows = []
-        for target_name in ['absent_sedentary', 'mvpa']:
+        
+        # Sweep targets with their inversion status
+        sweep_configs = [
+            ('sedentary_bout', True),      # Invert: activity < threshold
+            ('absent_sedentary', False),   # Normal: activity >= threshold
+            ('mvpa', False)                # Normal: activity >= threshold
+        ]
+        
+        for target_name, should_invert in sweep_configs:
             for thr in sweep_thresholds:
                 for cond in sleep_conditions:
                     subdf = subset(cond)
                     metrics = thresholded_classification_metrics(
                         subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
                         subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float),
-                        threshold=thr
+                        threshold=(thr, should_invert)
                     )
-                    # Only keep key metrics for sweep to reduce size
                     row = {
                         'target': target_name,
                         'condition': cond,
-                        'threshold': thr,
+                        'threshold': metrics['threshold_value'],
+                        'inverted': metrics['inverted'],
                         'f1': metrics.get('f1', np.nan),
                         'mcc': metrics.get('mcc', np.nan),
                         'sensitivity': metrics.get('sensitivity', np.nan),
@@ -400,9 +493,9 @@ def evaluate_run(
                     }
                     sweep_rows.append(row)
         
-        threshold_sweep_df = pd.DataFrame(sweep_rows)        
+        threshold_sweep_df = pd.DataFrame(sweep_rows)
+        output['threshold_sweep'] = threshold_sweep_df
 
-        output.update({'threshold_sweep': threshold_sweep_df})
 
     # ========== 5. (optional) UNCERTAINTY CALIBRATION TABLE ==========
     if evaluate_uncertainty:
@@ -492,9 +585,11 @@ def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
             df = df[ordered]
 
             if 'burn_in_days' not in df.columns:
-                df['burn_in_days'] = 40 # fix calibration run
+                default = 40
+                df['burn_in_days'] = default # fix calibration run
+                print(f"didn't find burn-in time. Set it to {default}")
             
-            # evaluate uncertainty? Assume one model per run!
+            # evaluate uncertainty? Assume one model per run!            
             models = df['model_name'].unique()
             burn_in_days = df['burn_in_days'].unique()
             assert len(burn_in_days)==1, f'only one burn_in_days per run allowed, but found {burn_in_days}'
@@ -578,8 +673,9 @@ def main():
     print(f"📁 Predictions path: {predictions_path}")
     print(f"💾 Metrics path: {metrics_path}")
     
-    # Find all prediction files
-    prediction_files = list(glob.glob(str(predictions_path / '*.csv')))
+    # Find all prediction files but leave out the failure file. Should start with "i<idx>_"
+    prediction_files = [str(f) for f in predictions_path.glob("*.csv") if re.match(r"^i\d+_", f.name)]
+    assert all(os.path.basename(f) != "failed.csv" for f in prediction_files), "failed.csv should not be read!"
     
     if args.limit:
         prediction_files = prediction_files[:args.limit]

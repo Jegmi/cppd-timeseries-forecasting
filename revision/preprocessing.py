@@ -107,15 +107,32 @@ def load_and_process_grid(p_idx, data_path, modality='activity',
     # - Bottom: kernel_day rows for initialization (filled with mean)
     # - Left: n_kernel_recent columns for past context
     # - Right: 0 (predictions fill these positions during the loop)
-    # - Top: 0 (no future days needed)
-    mean_value = np.mean(arr[~np.isnan(arr)])
-    arr2 = np.pad(arr.copy(), 
-                  pad_width=[(kernel_day, 0), (n_kernel_recent, 0)], 
-                  mode='constant', 
-                  constant_values=mean_value)
+    # - Top: 0 (no future days needed)    
+        
+    pad_h = n_kernel_recent
+    pad_v = kernel_day
     
-    # Initialize temporal context across day boundaries:
+    if pad_h == 0 and pad_v == 0:
+        return arr.copy(), valid_days, nan_days
+    
+    mean_value = np.mean(arr[~np.isnan(arr)])
+    arr2 = np.pad(
+        arr.copy(),
+        pad_width=[(pad_v, 0), (pad_h, 0)],
+        mode='constant',
+        constant_values=mean_value
+    )
+    
+    # Temporal context across days (only if horizontal padding exists)    
     # Copy end of previous day to start of next day (the left-padded region)
+    if pad_h > 0:
+        if pad_v > 0:
+            # original indexing
+            arr2[pad_v+1:, :pad_h] = arr2[pad_v:-1, -pad_h:]
+        else:
+            # no vertical padding → shift start index
+            arr2[1:, :pad_h] = arr2[:-1, -pad_h:]
+    
     arr2[kernel_day+1:, :n_kernel_recent] = arr2[kernel_day:-1, -n_kernel_recent:]
     
     return arr2.copy(), valid_days, nan_days
@@ -408,7 +425,7 @@ def ts_data_to_grids(
     # Save all patients in one file with timestamps
     if processed_path:
             
-        prefix = 'revision_nan_' if nan_thres_per_window > 0 else 'revision_'
+        prefix = f'revision_nan{nan_thres_per_window}_' if nan_thres_per_window > 0 else 'revision_'
         os.makedirs(processed_path, exist_ok=True)
         print('... save with prefix', prefix)
         

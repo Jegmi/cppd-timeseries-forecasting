@@ -12,13 +12,12 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-
 def main(make_scripts: bool):
-    # === Define parameters ===
-    run = '20251118_1926' 
+    # === Define parameters ===    
+    run = '20251222_1952' # '20251222_1325'
     base_path = '/sc/arion/projects/Clinical_Times_Series/cpp_data/runs'
     n_jobs = 16  # Number of parallel cores
-    do_threshold_sweep = False
+    do_threshold_sweep = True
     
     # Derived paths
     assert isinstance(run, str), f'run must be str, including an underscore but found {run} of type {type(run)}'
@@ -54,7 +53,7 @@ def main(make_scripts: bool):
 #BSUB -R "span[ptile=1]"
 #BSUB -R affinity[core({n_jobs})]
 #BSUB -R rusage[mem=16G]
-#BSUB -W 12:00
+#BSUB -W 48:00
 #BSUB -P acc_Clinical_Times_Series
 #BSUB -o logs/eval_{run}.%J.out
 #BSUB -e logs/eval_{run}.%J.err

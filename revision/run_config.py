@@ -20,6 +20,7 @@ def main():
                  help="root for processed files (optional)")
     p.add_argument("--output_path", default='/sc/arion/projects/Clinical_Times_Series/cpp_data/runs/', help="path for results (optional)")
     p.add_argument("--env-name", default=None, help="name/path for conda env (optional)")
+    p.add_argument("--verbose", default=1, type=int, help="1: verbosity high, 0: verbosity low")
     args = p.parse_args()
     
     # prep input of config
@@ -33,12 +34,12 @@ def main():
     patient_id = row["patient_id"] # int for single patient, otherwise str 
     window = int(row["window"])
     forecasting_modality = str(row["forecasting_modality"])
-    model_name = str(row.get("model_name", "rls"))
+    model_name = str(row.get("model_name", "lstm"))
     has_field = bool(row["has_field"])
     min_days = int(row["min_days"])
     prediction_horizon = int(row.get("prediction_horizon", 60))
     burn_in_days = int(row.get("burn_in_days", 10)) # only used for eval
-    verbose = 1
+    verbose = args.verbose
     
     # Resolve patient specification to list of IDs and data path
     try:
@@ -53,6 +54,7 @@ def main():
     safe_mod = forecasting_modality.replace("|", "_")
 
     if has_field:
+                
         field = row.get("field", "cross")
         lambda_forget = float(row["lambda_forget"])
         initial_uncertainty = float(row["initial_uncertainty"])
@@ -60,15 +62,20 @@ def main():
         kernel_day = int(row["kernel_day"])
         
         # New binary flags
-        diagonal_covariance = bool(row.get("diagonal_covariance", False))
-        use_polynomial = bool(row.get("use_polynomial", False))
-        use_logit_space = bool(row.get("use_logit_space", False))
+        diag_flag = bool(row.get("diagonal_covariance", False))
+        poly_flag = bool(row.get("use_polynomial", False))
+        logit_flag = bool(row.get("use_logit_space", False))
+
+        # Output file name
+        output_file = (f"i{args.index - 1}_p{patient_id}_w{window}_{safe_mod}_"
+                      f"m{model_name}_h{prediction_horizon}_f{field}_"
+                      f"d{int(diag_flag)}_poly{int(poly_flag)}_logit{int(logit_flag)}_burn{burn_in_days}.csv")
 
         # load run file
         from prob_models import run_prob
         
         # Create partial function with all common arguments
-        run_prob_configured = partial(
+        run_configured = partial(
             run_prob,
             processed_path,
             kernel_day=kernel_day,
@@ -77,9 +84,9 @@ def main():
             model_name=model_name,
             lambda_forget=lambda_forget,
             initial_uncertainty=initial_uncertainty,
-            diagonal_covariance=diagonal_covariance,
-            use_polynomial=use_polynomial,
-            use_logit_space=use_logit_space,
+            diagonal_covariance=diag_flag,
+            use_polynomial=poly_flag,
+            use_logit_space=logit_flag,
             verbose=verbose,
             min_days=min_days,
             forecasting_modality=forecasting_modality,
@@ -87,90 +94,97 @@ def main():
             burn_in_days=burn_in_days
         )
 
-        # Determine cohort name for logging and output        
 
-        print(f"==== Running config for Job {args.index}: {cohort_dir} ({len(patient_ids)} patient{'s' if len(patient_ids) > 1 else ''}) ====")
-        print(row.to_dict())
-        print("Processed path:", processed_path)
-        print(f"Patient IDs: {patient_ids[:5]}{'...' if len(patient_ids) > 5 else ''}")
-        print("========================")
-        
-        # init results
-        success = []
-        failure = []
-                    
-        for pid in patient_ids:
-            print(f"--- Processing patient: {pid} ---")
-            try:
-                single = run_prob_configured(patient_id=pid)
-        
-                # if insufficient data
-                if single[0]['valid_days'] < single[0]['min_days']:
-                    print("insufficient data for pid:", pid)
-                    failure.append({
-                        "pid": pid,
-                        "valid_days": single[0]['valid_days'],
-                        "nan_days": single[0]['nan_days'],
-                        "total_days": single[0]['total_days'],
-                        "min_days": single[0]['min_days'],
-                        "reason": "insufficient_data",
-                        "job_index": args.index - 1,
-                    })
-                    continue
-        
-                # if success
-                success.extend(single)
+    else: # baseline model dont have field
+        print(f'Use baseline model(s) for job {args.index}')
 
-            # if unknown failure
-            except Exception as e:
-                tb = traceback.format_exc()
-                print(f"!!! ERROR processing patient {pid} for job {args.index}: {e}")
-                print(tb)
+        # Output file name
+        output_file = (f"i{args.index - 1}_p{patient_id}_w{window}_{safe_mod}_"
+                      f"m{model_name}_h{prediction_horizon}_burn{burn_in_days}.csv")
         
+        # load run file
+        if 'arima' in model_name.lower():
+            # load run file
+            from arima_model import run_arima as run_fct
+        else:
+            from baseline_models import run_base as run_fct
+        
+        run_configured = partial(
+            run_fct,
+            processed_path,                   
+            verbose=verbose,            
+            **row # consructor will pick model specific parameters
+            )
+    
+    # Determine cohort name for logging and output        
+    print(f"==== Running config for Job {args.index}: {cohort_dir} ({len(patient_ids)} patient{'s' if len(patient_ids) > 1 else ''}) ====")
+    print(row.to_dict())
+    print("Processed path:", processed_path)
+    print(f"Patient IDs: {patient_ids[:5]}{'...' if len(patient_ids) > 5 else ''}")
+    print("========================")
+    
+    # init results
+    success = []
+    failure = []
+                
+    for pid in patient_ids:
+        print(f"--- Processing patient: {pid} ---")
+        try:
+            single = run_configured(patient_id=pid)
+    
+            # if insufficient data
+            if single[0]['valid_days'] < single[0]['min_days']:
+                print("insufficient data for pid:", pid)
                 failure.append({
                     "pid": pid,
+                    "valid_days": single[0]['valid_days'],
+                    "nan_days": single[0]['nan_days'],
+                    "total_days": single[0]['total_days'],
+                    "min_days": single[0]['min_days'],
+                    "reason": "insufficient_data",
                     "job_index": args.index - 1,
-                    "error": str(e),
-                    "traceback": tb,
-                    "reason": "exception",
                 })
+                continue
+    
+            # if success
+            success.extend(single)
+
+        # if unknown failure
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"!!! ERROR processing patient {pid} for job {args.index}: {e}")
+            print(tb)
+    
+            failure.append({
+                "pid": pid,
+                "job_index": args.index - 1,
+                "error": str(e),
+                "traceback": tb,
+                "reason": "exception",
+            })
        
-        # Create output filename with binary flags (0/1)
-        diag_flag = 1 if diagonal_covariance else 0
-        poly_flag = 1 if use_polynomial else 0
-        logit_flag = 1 if use_logit_space else 0
-        
-        output_file = (f"i{args.index - 1}_p{patient_id}_w{window}_{safe_mod}_"
-                      f"m{model_name}_h{prediction_horizon}_f{field}_"
-                      f"d{diag_flag}_poly{poly_flag}_logit{logit_flag}_burn{burn_in_days}.csv")
-        
-        # Make output directory
-        out_dir = args.output_path
-        os.makedirs(out_dir, exist_ok=True)
-        
-        out_path = os.path.join(out_dir, output_file)
-        failed_path = os.path.join(out_dir, "failed.csv")
-                
-        # Save results
-        if success:
-            df = pd.DataFrame(success)
-            df['cohort'] = cohort_dir
-            df.to_csv(out_path, index=False)
-            print(f"Saved {len(success)} results to: {out_path}")
-        else:
-            print(f"No results generated for job {args.index}. No file saved.")
-
-        if failure:
-            df_fail = pd.DataFrame(failure)
-            df_fail['cohort'] = cohort_dir
-            df_fail.to_csv(failed_path, index=False, mode='a',
-                           header=not os.path.exists(failed_path))
-            print(f"Saved {len(failure)} failures to: {failed_path}")
+    # Make output directory
+    out_dir = args.output_path
+    os.makedirs(out_dir, exist_ok=True)
+    
+    out_path = os.path.join(out_dir, output_file)
+    failed_path = os.path.join(out_dir, "failed.csv")
             
+    # Save results
+    if success:
+        df = pd.DataFrame(success)
+        df['cohort'] = cohort_dir
+        df.to_csv(out_path, index=False)
+        print(f"Saved {len(success)} results to: {out_path}")
+    else:
+        print(f"No results generated for job {args.index}. No file saved.")
 
-    else:  # baseline models
-        print(f'Implement baseline models for job {args.index}')
-        pass
-
+    if failure:
+        df_fail = pd.DataFrame(failure)
+        df_fail['cohort'] = cohort_dir
+        df_fail.to_csv(failed_path, index=False, mode='a',
+                       header=not os.path.exists(failed_path))
+        print(f"Saved {len(failure)} failures to: {failed_path}")
+        
 if __name__ == "__main__":
     main()

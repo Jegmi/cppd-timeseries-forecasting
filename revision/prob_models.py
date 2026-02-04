@@ -263,41 +263,7 @@ class RecursiveLeastSquares:
             return y_pred, y_std
         if return_intervals:
             return y_pred, {'lower': y_lower, 'upper': y_upper}
-        return y_pred
-
-
-def get_x(data, receptive_field, day, step, kernel_day, n_kernel_recent,n_forward):
-
-    block = data[day:day+kernel_day+1,step:step+n_kernel_recent+n_forward]                
-    xh = block[-1, :-n_forward]  # last row (hourly context)
-    xd = block[:-1, -n_forward]  # last columns (daily context)
-
-    if 'cross' in receptive_field:
-        x = list(xh) + list(xd)
-    elif 'block' in receptive_field:
-        x = list(block.copy().reshape(-1)[:-n_forward])  # remove target
-    elif 'hour' in receptive_field:
-        x = list(xh)
-    elif 'day' in receptive_field:
-        x = list(xd)
-    else:
-        assert x
-    return x
-
-def _get_combined_features(x_act, x_heart, forecasting_modality):
-    if forecasting_modality == 'ah|ah':
-        xa = x_act + x_heart
-        xh = x_act + x_heart
-    elif forecasting_modality == 'a|ah':
-        xa = x_act + x_heart
-        xh = x_heart
-    elif forecasting_modality == 'a|a':
-        xa = x_act
-        xh = x_heart
-    elif forecasting_modality == 'a|h':
-        xa = x_heart
-        xh = x_heart
-    return xa, xh
+        return y_pred        
 
 
 def get_model(model_name, n_features, n_outputs=1, 
@@ -354,6 +320,39 @@ def get_model(model_name, n_features, n_outputs=1,
     )
 
     return model
+
+def get_x(data, receptive_field, day, step, kernel_day, n_kernel_recent,n_forward):
+
+    block = data[day:day+kernel_day+1,step:step+n_kernel_recent+n_forward]                
+    xh = block[-1, :-n_forward]  # last row (hourly context)
+    xd = block[:-1, -n_forward]  # last columns (daily context)
+
+    if 'cross' in receptive_field:
+        x = list(xh) + list(xd)
+    elif 'block' in receptive_field:
+        x = list(block.copy().reshape(-1)[:-n_forward])  # remove target
+    elif 'hour' in receptive_field:
+        x = list(xh)
+    elif 'day' in receptive_field:
+        x = list(xd)
+    else:
+        assert x
+    return x
+
+def _get_combined_features(x_act, x_heart, forecasting_modality):
+    if forecasting_modality == 'ah|ah':
+        xa = x_act + x_heart
+        xh = x_act + x_heart
+    elif forecasting_modality == 'a|ah':
+        xa = x_act + x_heart
+        xh = x_heart
+    elif forecasting_modality == 'a|a':
+        xa = x_act
+        xh = x_heart
+    elif forecasting_modality == 'a|h':
+        xa = x_heart
+        xh = x_heart
+    return xa, xh
 
 
 def run_prob(
@@ -718,3 +717,5 @@ def run_prob(
             print(f'  Mean heart rate std: {np.nanmean(res_df.heart_std):.2f} bpm')
     
     return res
+
+

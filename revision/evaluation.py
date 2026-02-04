@@ -1,5 +1,5 @@
 """
-Parallel evaluation script for model predictions.
+Parallel evaluation script for model predictions with prediction index support.
 
 Usage:
     python evaluate_parallel.py --run 20251112_1611 --n-jobs 8
@@ -16,7 +16,7 @@ from multiprocessing import Pool, cpu_count
 import pandas as pd
 from tqdm import tqdm
 
-import warnings  # (optional, if you later add warning handling)
+import warnings
 import pandas as pd
 import numpy as np
 from sklearn.metrics import (
@@ -190,12 +190,6 @@ def classification_curve_metrics(y_true_bin, y_prob):
 
 
 # ========== Uncertainty Scores ========
-# Assuming 90 CI are read out
-# coverage < 0.90: Model is overconfident (P0 too small) → increase initial_uncertainty
-# coverage > 0.90: Model is underconfident (P0 too large) → decrease initial_uncertainty
-# coverage ≈ 0.90 but large width: Calibrated but not sharp → improve model features
-# Ideal: coverage ≈ 0.90 AND small width
-
 
 def coverage_metrics(y_true, y_pred, y_lower, y_upper, confidence=0.90):
     """
@@ -278,7 +272,7 @@ def interval_score(y_true, y_lower, y_upper, alpha=0.10):
 def evaluate_run(
     df,
     meta_cols=None,
-    thresholds=None,  # Now more flexible
+    thresholds=None,
     do_threshold_sweep=False,
     sweep_thresholds=None,
     evaluate_uncertainty=True,
@@ -286,6 +280,9 @@ def evaluate_run(
 ):
     """
     Evaluate one run DataFrame and return structured tables.
+    
+    If 'prediction_index' column exists, all metrics are computed separately 
+    for each prediction index value.
     
     Parameters
     ----------
@@ -304,12 +301,17 @@ def evaluate_run(
     # Default thresholds with clear semantics
     if thresholds is None:
         thresholds = {
-            'sedentary_bout': (0.01, True),   # Detect LOW activity
+            'sedentary_bout00': (0.00, True),   # Detect LOW activity
+            'sedentary_bout01': (0.01, True),   # Detect LOW activity
+            'sedentary_bout02': (0.02, True),   # Detect LOW activity
+            'sedentary_bout03': (0.03, True),   # Detect LOW activity
+            'sedentary_bout04': (0.04, True),   # Detect LOW activity
+            'sedentary_bout05': (0.05, True),   # Detect LOW activity
+            'sedentary_bout07': (0.07, True),   # Detect LOW activity
+            'sedentary_bout10': (0.1, True),   # Detect LOW activity
             'absent_sedentary': 0.01,          # Detect NON-sedentary
             'mvpa': 1/3                        # Detect moderate-vigorous
         }
-    
-    # [Rest of your metadata and setup code...]
     
     # ========== METADATA TABLE ==========
     if meta_cols is None:
@@ -336,18 +338,47 @@ def evaluate_run(
     metadata['sleep_n_false'] = int((df[sleep_col] == False).sum())
     metadata['n_total_rows'] = int(len(df))    
     
+    # Check if we have prediction_index column
+    has_pred_index = 'prediction_index' in df.columns
+    if has_pred_index:
+        pred_indices = sorted(df['prediction_index'].unique())
+        metadata['n_prediction_indices'] = len(pred_indices)
+        metadata['prediction_indices'] = str(pred_indices)
+    else:
+        pred_indices = [None]  # Single "virtual" index for backwards compatibility
+        metadata['n_prediction_indices'] = 1
+    
     metadata_df = pd.DataFrame([metadata])
 
-    # Helper to filter by sleep condition
-    def subset(condition):
+    # Helper to filter by sleep condition AND prediction index
+    def subset(condition, pred_idx=None):
+        """
+        Filter dataframe by sleep condition and optionally by prediction_index.
+        
+        Parameters
+        ----------
+        condition : str
+            One of 'all', 'sleep_true', 'sleep_false'
+        pred_idx : int or None
+            If not None and 'prediction_index' column exists, filter by this index
+        """
+        result = df
+        
+        # Filter by sleep condition
         if condition == 'all':
-            return df
+            pass
         elif condition == 'sleep_true':
-            return df[df[sleep_col] == True]
+            result = result[result[sleep_col] == True]
         elif condition == 'sleep_false':
-            return df[df[sleep_col] == False]
+            result = result[result[sleep_col] == False]
         else:
             raise ValueError(f"Unknown condition: {condition}")
+        
+        # Filter by prediction index if applicable
+        if pred_idx is not None and has_pred_index:
+            result = result[result['prediction_index'] == pred_idx]
+        
+        return result
 
     # Prepare data
     df = df.copy()
@@ -360,11 +391,21 @@ def evaluate_run(
         assert (preds.max() <= 1) & (preds.min() >= 0), 'predictions must be in [0, 1]'
     
     # Define binary targets
-    target_names = ['sedentary_bout', 'absent_sedentary', 'mvpa']
-    df['sedentary_bout'] = (df['activity_true'] == 0).astype(float)
-    df['absent_sedentary'] = (df['activity_true'] > 0).astype(float)
-    df['mvpa'] = (df['activity_true'] > (1/3)).astype(float)
-    
+    target_names = list(thresholds.keys()) # ['sedentary_bout', 'absent_sedentary', 'mvpa']    
+    for target_name, threshold_config in thresholds.items():    
+        if isinstance(threshold_config, tuple):
+            threshold, detect_low = threshold_config
+        else:
+            # Backward compatibility: assume scalar means detect_low=False
+            threshold = threshold_config
+            detect_low = False
+        
+        # Create binary target based on direction
+        if detect_low:
+            df[target_name] = (df['activity_true'] <= threshold).astype(float)
+        else:
+            df[target_name] = (df['activity_true'] > threshold).astype(float)  
+            
     metadata_df['n_before_dropna'] = n_before
     metadata_df['n_after_dropna'] = n_after
 
@@ -377,77 +418,89 @@ def evaluate_run(
         'heart': ('heart_true', 'heart_pred')
     }
     
-    for task_name, (col_true, col_pred) in tasks.items():
-        for cond in sleep_conditions:
-            subdf = subset(cond)
-            metrics = regression_metrics(
-                subdf[col_true] if col_true in subdf.columns else pd.Series(dtype=float),
-                subdf[col_pred] if col_pred in subdf.columns else pd.Series(dtype=float)
-            )
-            row = {'task': task_name, 'condition': cond}
-            row.update(metrics)
-            regression_rows.append(row)
+    for pred_idx in pred_indices:
+        for task_name, (col_true, col_pred) in tasks.items():
+            for cond in sleep_conditions:
+                subdf = subset(cond, pred_idx)
+                metrics = regression_metrics(
+                    subdf[col_true] if col_true in subdf.columns else pd.Series(dtype=float),
+                    subdf[col_pred] if col_pred in subdf.columns else pd.Series(dtype=float)
+                )
+                row = {'task': task_name, 'condition': cond}
+                if has_pred_index:
+                    row['prediction_index'] = pred_idx
+                row.update(metrics)
+                regression_rows.append(row)
     
     regression_df = pd.DataFrame(regression_rows)    
     
     # ========== CLASSIFICATION AUC TABLE ==========
     classification_auc_rows = []
     
-    for target_name in target_names:
-        for cond in sleep_conditions:
-            subdf = subset(cond)
-            
-            # For sedentary_bout, we need to invert predictions for AUC
-            y_prob = subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float)
-            if target_name == 'sedentary_bout':
-                y_prob = 1 - y_prob  # Invert: want low activity scores
-            
-            metrics = classification_curve_metrics(
-                subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
-                y_prob
-            )
-            
-            # Add label balance info
-            if target_name in subdf.columns:
-                mask = subdf[target_name].notna()
-                n = int(mask.sum())
-                if n > 0:
-                    pos = int((subdf.loc[mask, target_name] == 1).sum())
-                    balance = pos / n
+    for pred_idx in pred_indices:
+        for target_name in target_names:
+            for cond in sleep_conditions:
+                subdf = subset(cond, pred_idx)
+                
+                # Get threshold config and normalize
+                threshold_config = thresholds[target_name]
+                threshold_value, should_invert = normalize_threshold(threshold_config)
+                
+                y_prob = subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float)
+                if should_invert:
+                    y_prob = 1 - y_prob  # Invert: want low activity scores
+                
+                metrics = classification_curve_metrics(
+                    subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
+                    y_prob
+                )
+                
+                # Add label balance info
+                if target_name in subdf.columns:
+                    mask = subdf[target_name].notna()
+                    n = int(mask.sum())
+                    if n > 0:
+                        pos = int((subdf.loc[mask, target_name] == 1).sum())
+                        balance = pos / n
+                    else:
+                        balance = np.nan
                 else:
                     balance = np.nan
-            else:
-                balance = np.nan
-                n = 0
-            
-            row = {
-                'target': target_name,
-                'condition': cond,
-                'roc_auc': metrics['roc_auc'],
-                'pr_auc': metrics['pr_auc'],
-                'n': metrics['n'],
-                'balance': balance
-            }
-            classification_auc_rows.append(row)
+                    n = 0
+                
+                row = {
+                    'target': target_name,
+                    'condition': cond,
+                    'roc_auc': metrics['roc_auc'],
+                    'pr_auc': metrics['pr_auc'],
+                    'n': metrics['n'],
+                    'balance': balance
+                }
+                if has_pred_index:
+                    row['prediction_index'] = pred_idx
+                classification_auc_rows.append(row)
     
     classification_auc_df = pd.DataFrame(classification_auc_rows)    
     
     # ========== CLASSIFICATION THRESHOLD TABLE ==========
     classification_threshold_rows = []
     
-    for target_name in target_names:
-        threshold = thresholds.get(target_name, 0.5)
-        
-        for cond in sleep_conditions:
-            subdf = subset(cond)
-            metrics = thresholded_classification_metrics(
-                subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
-                subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float),
-                threshold=threshold
-            )
-            row = {'target': target_name, 'condition': cond}
-            row.update(metrics)
-            classification_threshold_rows.append(row)
+    for pred_idx in pred_indices:
+        for target_name in target_names:
+            threshold = thresholds.get(target_name, 0.5)
+            
+            for cond in sleep_conditions:
+                subdf = subset(cond, pred_idx)
+                metrics = thresholded_classification_metrics(
+                    subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
+                    subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float),
+                    threshold=threshold
+                )
+                row = {'target': target_name, 'condition': cond}
+                if has_pred_index:
+                    row['prediction_index'] = pred_idx
+                row.update(metrics)
+                classification_threshold_rows.append(row)
     
     classification_threshold_df = pd.DataFrame(classification_threshold_rows)    
 
@@ -466,38 +519,58 @@ def evaluate_run(
         sweep_rows = []
         
         # Sweep targets with their inversion status
-        sweep_configs = [
-            ('sedentary_bout', True),      # Invert: activity < threshold
-            ('absent_sedentary', False),   # Normal: activity >= threshold
-            ('mvpa', False)                # Normal: activity >= threshold
-        ]
+        sweep_configs = []
+        for target_name, threshold_config in thresholds.items():
+            _, should_invert = normalize_threshold(threshold_config)
+            sweep_configs.append((target_name, should_invert))        
         
-        for target_name, should_invert in sweep_configs:
-            for thr in sweep_thresholds:
-                for cond in sleep_conditions:
-                    subdf = subset(cond)
-                    metrics = thresholded_classification_metrics(
-                        subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
-                        subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float),
-                        threshold=(thr, should_invert)
-                    )
-                    row = {
-                        'target': target_name,
-                        'condition': cond,
-                        'threshold': metrics['threshold_value'],
-                        'inverted': metrics['inverted'],
-                        'f1': metrics.get('f1', np.nan),
-                        'mcc': metrics.get('mcc', np.nan),
-                        'sensitivity': metrics.get('sensitivity', np.nan),
-                        'specificity': metrics.get('specificity', np.nan)
-                    }
-                    sweep_rows.append(row)
+        # Track max F1 for each group
+        max_f1_tracker = {}  # key: (pred_idx, target_name, cond), value: (max_f1, row_index)
+        
+        for pred_idx in pred_indices:
+            for target_name, should_invert in sweep_configs:
+                for thr in sweep_thresholds:
+                    for cond in sleep_conditions:
+                        subdf = subset(cond, pred_idx)
+                        metrics = thresholded_classification_metrics(
+                            subdf[target_name] if target_name in subdf else pd.Series(dtype=float),
+                            subdf['activity_pred'] if 'activity_pred' in subdf else pd.Series(dtype=float),
+                            threshold=(thr, should_invert)
+                        )
+                        
+                        f1_val = metrics.get('f1', np.nan)
+                        row = {
+                            'target': target_name,
+                            'condition': cond,
+                            'threshold': metrics['threshold_value'],
+                            'inverted': metrics['inverted'],
+                            'f1': f1_val,
+                            'mcc': metrics.get('mcc', np.nan),
+                            'sensitivity': metrics.get('sensitivity', np.nan),
+                            'specificity': metrics.get('specificity', np.nan),
+                            'max_f1': False
+                        }
+                        if has_pred_index:
+                            row['prediction_index'] = pred_idx
+                        
+                        row_idx = len(sweep_rows)
+                        sweep_rows.append(row)
+                        
+                        # Track if this is the best F1 so far for this group
+                        group_key = (pred_idx, target_name, cond) if has_pred_index else (target_name, cond)
+                        if not np.isnan(f1_val):
+                            if group_key not in max_f1_tracker or f1_val > max_f1_tracker[group_key][0]:
+                                max_f1_tracker[group_key] = (f1_val, row_idx)
+        
+        # Mark the max F1 rows
+        for _, row_idx in max_f1_tracker.values():
+            sweep_rows[row_idx]['max_f1'] = True
         
         threshold_sweep_df = pd.DataFrame(sweep_rows)
         output['threshold_sweep'] = threshold_sweep_df
 
 
-    # ========== 5. (optional) UNCERTAINTY CALIBRATION TABLE ==========
+    # ========== UNCERTAINTY CALIBRATION TABLE ==========
     if evaluate_uncertainty:
         uncertainty_rows = []
         
@@ -515,40 +588,41 @@ def evaluate_run(
             tasks.append(('heart', 'heart_true', 'heart_pred', 
                          'heart_low', 'heart_up'))
         
-        for task_name, col_true, col_pred, col_low, col_up in tasks:
-            for cond in sleep_conditions:
-                subdf = subset(cond)
-                
-                # Coverage metrics
-                cov_metrics = coverage_metrics(
-                    subdf[col_true],
-                    subdf[col_pred],
-                    subdf[col_low],
-                    subdf[col_up],
-                    confidence=0.90
-                )
-                
-                # Interval score
-                int_metrics = interval_score(
-                    subdf[col_true],
-                    subdf[col_low],
-                    subdf[col_up],
-                    alpha=0.10
-                )
-                
-                row = {
-                    'task': task_name,
-                    'condition': cond,
-                    **cov_metrics,
-                    **int_metrics
-                }
-                uncertainty_rows.append(row)
+        for pred_idx in pred_indices:
+            for task_name, col_true, col_pred, col_low, col_up in tasks:
+                for cond in sleep_conditions:
+                    subdf = subset(cond, pred_idx)
+                    
+                    # Coverage metrics
+                    cov_metrics = coverage_metrics(
+                        subdf[col_true],
+                        subdf[col_pred],
+                        subdf[col_low],
+                        subdf[col_up],
+                        confidence=0.90
+                    )
+                    
+                    # Interval score
+                    int_metrics = interval_score(
+                        subdf[col_true],
+                        subdf[col_low],
+                        subdf[col_up],
+                        alpha=0.10
+                    )
+                    
+                    row = {
+                        'task': task_name,
+                        'condition': cond,
+                        **cov_metrics,
+                        **int_metrics
+                    }
+                    if has_pred_index:
+                        row['prediction_index'] = pred_idx
+                    uncertainty_rows.append(row)
         
         if uncertainty_rows:
             uncertainty_calibration_df = pd.DataFrame(uncertainty_rows)
             output['uncertainty_calibration'] = uncertainty_calibration_df
-    
-
     
     return output
 
@@ -586,9 +660,19 @@ def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
 
             if 'burn_in_days' not in df.columns:
                 default = 40
-                df['burn_in_days'] = default # fix calibration run
+                df['burn_in_days'] = default
                 print(f"didn't find burn-in time. Set it to {default}")
-            
+
+            # only eval for training (in case of RNNs)
+            if 'is_train' in df.columns:
+                keep = ~df.is_train
+                removed = df.is_train.sum()
+                print('remove', removed, 'training predictions from len(df) =', len(df))
+                df = df[keep]
+
+                #print('hard coded filter for 60')
+                #df = df[df.dt == 60]
+                
             # evaluate uncertainty? Assume one model per run!            
             models = df['model_name'].unique()
             burn_in_days = df['burn_in_days'].unique()
@@ -623,9 +707,6 @@ def process_single_file(path_tuple, runs_path, do_threshold_sweep=False):
     except pd.errors.EmptyDataError:
         print(f"⚠️ Skipping empty file: {path}")
         return {}
-    #except Exception as e:
-    #   print(f"❌ Error processing {path}: {e}")
-    #  return {}
 
 def main():
     parser = argparse.ArgumentParser(
